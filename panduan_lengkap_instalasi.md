@@ -19,6 +19,7 @@ Dokumen ini memandu instalasi di tiga platform hosting:
   - [A.2 Midtrans (wajib untuk pembayaran asli)](#a2-midtrans-wajib-untuk-pembayaran-asli)
   - [A.3 WhatsApp Cloud API (opsional, direkomendasikan)](#a3-whatsapp-cloud-api-opsional-direkomendasikan)
   - [A.4 Variabel Lingkungan Lengkap](#a4-variabel-lingkungan-lengkap)
+  - [A.5 Integrasi Database Bawaan Panel (cPanel / Easypanel / aaPanel)](#a5-integrasi-database-bawaan-panel-cpanel--easypanel--aapanel)
 - [Bagian B — Persiapan di Mesin Lokal (sekali)](#bagian-b-persiapan-di-mesin-lokal-sekali)
 - [1. Instalasi di cPanel](#1-instalasi-di-cpanel)
 - [2. Instalasi di Easypanel](#2-instalasi-di-easypanel)
@@ -105,6 +106,99 @@ Aplikasi **tidak menyimpan database sendiri** — semua data tinggal di **Supaba
 | `PORT` | opsional | port aplikasi (default `3000`) |
 
 > Template lengkap dengan komentar ada di `.env.example`. Tanpa semua kredensial, aplikasi tetap jalan dalam **mode demo** (pembayaran disimulasikan, data di `data/db.json`) — berguna untuk uji tampilan, tapi untuk produksi isi minimal Supabase + Midtrans.
+
+### A.5 Integrasi Database Bawaan Panel (cPanel / Easypanel / aaPanel)
+
+#### ⚠️ Baca dulu: kenapa bukan sekadar "buat database PostgreSQL"
+
+V Shop **tidak membaca PostgreSQL secara langsung**. Aplikasi ini terhubung ke **Supabase** — yang memang dibangun di atas PostgreSQL, tapi menyediakan 4 hal yang wajib bagi aplikasi ini:
+
+1. **REST API (PostgREST)** — semua operasi data lewat HTTP (`…/rest/v1/…`) dengan kunci anon/service-role; tidak ada driver SQL (`pg`) di aplikasi.
+2. **Auth (GoTrue)** — login OTP WhatsApp / password, JWT, sesi. Migration memakai fungsi `auth.uid()` di policy RLS.
+3. **Storage** — bucket `vshop-assets` (foto usaha/produk) + policy di `storage.objects`.
+4. **RLS** — `row level security` di 12 tabel dengan `auth.uid()` sebagai pemilik baris.
+
+Akibatnya: **PostgreSQL mentah bawaan panel tidak bisa dipakai langsung** — tanpa stack Supabase, login/OTP mati, query kena error (`auth.uid()` tidak ada), dan storage tidak berfungsi. "Integrasi database bawaan panel" yang benar = **menjalankan stack Supabase (self-hosted) di panel tersebut**, lalu mengarahkan aplikasi ke instance itu. Berikut ringkasannya:
+
+| Platform | PostgreSQL bawaan | Cara integrasi yang benar |
+|---|---|---|
+| **cPanel** (shared hosting) | ❌ Tidak bisa | Tidak ada cara menjalankan container Supabase di shared hosting → **tetap pakai Supabase cloud** (A.1). Postgres cPanel hanya untuk administrasi/backup SQL manual. |
+| **Easypanel** (VPS) | ✅ Bisa | Deploy **template resmi "Supabase"** dari marketplace Easypanel (butuh VPS ≥ 4 GB RAM) → arahkan env aplikasi ke instance itu. |
+| **aaPanel** (VPS) | ✅ Bisa | Jalankan **Supabase self-hosted via Docker Compose** resmi (`supabase/docker`) → arahkan env aplikasi. |
+
+---
+
+#### A.5.1 cPanel — keterbatasan & alternatif
+
+1. cPanel → **PostgreSQL Databases** memang bisa membuat database + user, tetapi itu Postgres **mentah** (tanpa PostgREST/Auth/Storage). Shared hosting juga tidak mengizinkan menjalankan container — jadi **aplikasi tidak bisa diarahkan ke database cPanel**. Mengarahkannya hanya akan membuat login, pembayaran, dan storage rusak.
+2. Yang bisa dilakukan dengan Postgres bawaan cPanel: buat database (mis. `vshop_db` + user + semua privilege), lalu catat koneksinya (`localhost:5432/vshop_db`) untuk **administrasi manual / backup** lewat pgAdmin atau DBeaver — bukan untuk aplikasi.
+3. **Rekomendasi**: gunakan **Supabase cloud** (Bagian A.1). Jika ingin data "tinggal di server sendiri", gunakan VPS + Easypanel/aaPanel (di bawah) — bukan cPanel shared.
+
+#### A.5.2 Easypanel — Supabase self-hosted (langkah penuh)
+
+1. **Prasyarat**: VPS dengan Easypanel, **RAM ≥ 4 GB** (rekomendasi 8 GB), disk ≥ 40 GB.
+2. Dashboard Easypanel → buka proyek → **Add Service → From Template** → cari **"Supabase"** (template resmi: `easypanel.io/templates/supabase`) → **Deploy** (pull image + start semua komponen: Postgres, Auth, PostgREST, Storage, Studio, gateway).
+3. Setelah sehat, buka **Studio**: `http://IP_SERVER:8000` (atau domain yang Anda arahkan) — login memakai `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` dari `.env` template.
+4. **Jalankan 12 migration**: Studio → **SQL Editor** → tempel & eksekusi isi `supabase/migrations/0001_init.sql` … `0012_storage_owner.sql` **secara urut** (sama seperti Bagian A.1 langkah 2).
+5. **Ambil kredensial** dari `.env` stack Supabase (lihat `sh run.sh secrets` / file `.env`):
+
+   | Kunci di `.env` Supabase self-hosted | Variabel aplikasi V Shop |
+   |---|---|
+   | `SUPABASE_PUBLIC_URL` (mis. `http://IP:8000`) | `NEXT_PUBLIC_SUPABASE_URL` |
+   | `SUPABASE_PUBLISHABLE_KEY` (versi lama: `ANON_KEY`) | `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
+   | `SUPABASE_SECRET_KEY` (versi lama: `SERVICE_ROLE_KEY`) | `SUPABASE_SERVICE_ROLE_KEY` |
+
+6. Di **service V Shop** di Easypanel → **Environment Variables**: set 3 kunci di atas (sisanya tetap, mis. `MIDTRANS_*`, `WHATSAPP_*`) → **Deploy** ulang.
+7. **Verifikasi**: buka `https://vshop.anda.com/api/health` → `storeMode: "supabase"`, `supabase.postgres.ok: true`.
+
+> Catatan penting:
+> - **OTP WhatsApp** di self-hosted butuh **SMS provider (Twilio)** yang dikonfigurasi di komponen Auth (var `GOTRUE_SMS_TWILIO_*` / `AUTH_SMS_*`). Tanpa itu, pelanggan tetap bisa masuk via **tab Password** (default aktif).
+> - Ganti **semua secret default** di `.env` (khususnya `DASHBOARD_PASSWORD`, `POSTGRES_PASSWORD`, kedua API key) sebelum dipakai produksi.
+> - Hemat resource: layanan yang tidak terpakai aplikasi ini (Realtime, imgproxy, Edge Functions, Logflare/Analytics) bisa dihapus dari `docker-compose.yml` bila RAM terbatas — asal **Postgres, Auth, Rest, Storage, Studio, dan API gateway tetap ada**.
+
+#### A.5.3 aaPanel — Supabase self-hosted via Docker Compose (langkah penuh)
+
+1. **Prasyarat**: VPS dengan aaPanel, **RAM ≥ 4 GB**, disk ≥ 40 GB. Install **Docker** (+ Compose) dari aaPanel → **App Store → Docker**.
+2. Buka **aaPanel → Terminal**, jalankan cara cepat (Linux):
+   ```bash
+   cd /opt
+   curl -fsSL https://supabase.link/setup.sh | sh   # membuat supabase-project/ + generate secrets
+   cd supabase-project
+   sh run.sh start      # = docker compose up -d --wait (semua service sehat)
+   sh run.sh secrets    # tampilkan kredensial (username/password, API keys, URL)
+   ```
+   Atau **cara manual** (kontrol penuh):
+   ```bash
+   cd /opt
+   git clone --depth 1 --branch self-hosted/v0.8.0 https://github.com/supabase/supabase
+   mkdir -p supabase-project && cp -rf supabase/docker/. supabase-project/
+   cd supabase-project
+   cp .env.example .env
+   sh utils/generate-keys.sh        # secret acak
+   sh utils/add-new-auth-keys.sh    # API keys + pasangan JWT
+   # Edit .env: isi SUPABASE_PUBLIC_URL (http://IP:8000), API_EXTERNAL_URL,
+   # SITE_URL, dan DASHBOARD_PASSWORD (wajib huruf, bukan angka saja)
+   docker compose pull && sh run.sh start
+   ```
+3. **Buka Studio**: `http://IP_SERVER:8000` (basic auth dari `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD`).
+4. **Jalankan 12 migration** (`supabase/migrations/0001…0012`) lewat Studio → **SQL Editor**, urut seperti Bagian A.1.
+5. **Buka port / proxy domain**: di aaPanel → **Security** izinkan port **8000** (atau lebih aman: **Website → domain → Reverse Proxy** ke `127.0.0.1:8000` + SSL, sehingga akses lewat `https://supabase.anda.com`).
+6. **Peta kredensial ke env aplikasi** — sama seperti tabel di [A.5.2](#a52-easypanel--supabase-self-hosted-langkah-penuh): `SUPABASE_PUBLIC_URL` → `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` → `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SECRET_KEY` → `SUPABASE_SERVICE_ROLE_KEY`. Simpan di `.env` proyek V Shop (aaPanel → File → edit `/www/wwwroot/vshop/.env`) lalu **restart** Node project (PM2).
+7. **Verifikasi**: `curl https://vshop.anda.com/api/health` → `storeMode: "supabase"` dan `postgres.ok: true`.
+
+> Catatan: keamanan & resource sama seperti Easypanel — ganti secret default, siapkan Twilio bila ingin OTP, dan boleh menonaktifkan layanan yang tidak terpakai. Setelah env mengarah ke instance self-hosted, verifikasi RLS bisa dijalankan ulang: `npm run db:rls` (setelah `npm run db:seed` untuk user demo).
+
+#### A.5.4 Cloud vs Self-hosted — pilih yang mana?
+
+| Aspek | Supabase Cloud (A.1) | Self-hosted di panel (A.5) |
+|---|---|---|
+| Setup | Paling cepat (15 menit) | 1–2 jam + perawatan sendiri |
+| Resource VPS | Tidak butuh (di luar server aplikasi) | Butuh ≥ 4 GB RAM khusus Supabase |
+| Backup/uptime | Dikelola Supabase (otomatis) | Anda sendiri (pg_dump + monitoring) |
+| Data & kepatuhan | Di cloud Supabase (region bisa dipilih) | Sepenuhnya di server Anda |
+| Biaya | Langganan (ada free tier) | Gratis (hanya biaya VPS) |
+
+**Rekomendasi**: produksi umum → **Supabase Cloud** (lebih sedikit yang harus diurus). Gunakan **self-hosted** bila data wajib berada di server sendiri / ingin menghindari biaya langganan — dengan syarat Anda siap memelihara dan membackup stack Supabase.
 
 ---
 
