@@ -3,6 +3,7 @@ import { requireRole } from "@/lib/auth";
 import { getMerchantByUserId } from "@/lib/service";
 import { merchantCode } from "@/lib/format";
 import LogoutButton from "@/components/LogoutButton";
+import RoleNavLink from "@/components/RoleNavLink";
 
 export default function MerchantLayout({ children }: { children: React.ReactNode }) {
   const user = requireRole(["merchant", "admin"]);
@@ -76,14 +77,7 @@ export default function MerchantLayout({ children }: { children: React.ReactNode
         </div>
         <nav className="flex gap-1 overflow-x-auto px-3 pb-3 lg:flex-1 lg:flex-col lg:overflow-visible lg:pb-0" aria-label="Navigasi merchant">
           {nav.map((item) => (
-            <Link
-              key={item.href}
-              href={item.href}
-              className="flex shrink-0 items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900"
-            >
-              <span aria-hidden="true">{item.icon}</span>
-              {item.label}
-            </Link>
+            <RoleNavLink key={item.href} href={item.href} label={item.label} icon={item.icon} />
           ))}
         </nav>
         <div className="hidden border-t border-gray-200 p-4 lg:block">

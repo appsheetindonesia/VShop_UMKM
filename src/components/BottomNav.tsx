@@ -14,8 +14,12 @@ export default function BottomNav() {
   const pathname = usePathname();
 
   return (
+    // Posisi mengambang (floating pill): ujung kiri & kanan berbentuk oval
+    // (rounded-full) dengan jarak dari tepi layar. Safe-area iPhone:
+    // bottom = 0.75rem + env(safe-area-inset-bottom) agar tidak tertutup
+    // gesture bar (home indicator); di browser non-iOS inset = 0.
     <nav
-      className="fixed inset-x-0 bottom-0 z-40 border-t border-gray-200 bg-white/95 backdrop-blur md:hidden"
+      className="fixed inset-x-3 bottom-[calc(0.75rem_+_env(safe-area-inset-bottom))] z-40 rounded-full border border-gray-200 bg-white/95 shadow-lg shadow-gray-200/60 backdrop-blur md:hidden"
       aria-label="Navigasi bawah"
     >
       <div className="mx-auto flex max-w-md items-stretch justify-around px-2">
@@ -26,14 +30,22 @@ export default function BottomNav() {
             <Link
               key={item.href}
               href={item.href}
-              className={`flex flex-1 flex-col items-center gap-0.5 py-2 text-[11px] font-semibold ${
-                active ? "text-brand-600" : "text-gray-400"
-              }`}
+              aria-current={active ? "page" : undefined}
+              className="flex flex-1 items-center justify-center py-1"
             >
-              <span className="text-xl leading-none" aria-hidden="true">
-                {item.icon}
+              {/* Item aktif: pill oval tersendiri (background brand + ikon/label putih). */}
+              <span
+                className={`flex flex-col items-center gap-0.5 rounded-full px-4 py-1.5 text-[11px] font-semibold transition-colors ${
+                  active
+                    ? "bg-brand-600 text-white shadow-md shadow-brand-600/30"
+                    : "text-gray-400"
+                }`}
+              >
+                <span className="text-xl leading-none" aria-hidden="true">
+                  {item.icon}
+                </span>
+                {item.label}
               </span>
-              {item.label}
             </Link>
           );
         })}
