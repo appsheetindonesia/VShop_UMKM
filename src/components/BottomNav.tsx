@@ -33,12 +33,11 @@ export default function BottomNav() {
               aria-current={active ? "page" : undefined}
               className="flex flex-1 items-center justify-center py-1"
             >
-              {/* Item aktif: pill oval tersendiri (background brand + ikon/label putih). */}
+              {/* Item aktif: pill oval tersendiri. Warna (soft/solid) dipilih
+                  admin lewat Configurasi — class nav-pill-active di globals.css. */}
               <span
-                className={`flex flex-col items-center gap-0.5 rounded-full px-4 py-1.5 text-[11px] font-semibold transition-colors ${
-                  active
-                    ? "bg-brand-600 text-white shadow-md shadow-brand-600/30"
-                    : "text-gray-400"
+                className={`flex flex-col items-center gap-0.5 rounded-full px-4 py-1.5 text-[11px] font-semibold transition-all duration-150 ease-out ${
+                  active ? "scale-105 nav-pill-active" : "text-gray-400"
                 }`}
               >
                 <span className="text-xl leading-none" aria-hidden="true">

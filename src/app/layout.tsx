@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { cookies, headers } from "next/headers";
 import "./globals.css";
 import { ensureHydrated, fetchSessionIntoCache, registerShutdownFlush } from "@/lib/db";
-import { ensureSettingsHydrated } from "@/lib/settings";
+import { ensureSettingsHydrated, navPillStyle } from "@/lib/settings";
 import { SESSION_COOKIE } from "@/lib/session-cookies";
 import {
   startDailySummaryScheduler,
@@ -27,6 +27,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   // Pengaturan koneksi (menu admin Configurasi) ikut di-hydrate agar nilai
   // tersimpan menang atas env var untuk request berikutnya.
   await ensureSettingsHydrated();
+  // Gaya pill navigasi (soft/solid) — data-nav-pill di <html> dipakai CSS
+  // di globals.css untuk mewarnai pill aktif (toko + admin/merchant).
+  const navPill = navPillStyle();
 
   // Middleware (Edge) memperbarui/membuat sesi di sisi server SEBELUM
   // render — baris sesinya tidak ada di cache proses Node ini, jadi
@@ -55,7 +58,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   }
 
   return (
-    <html lang="id">
+    <html lang="id" data-nav-pill={navPill}>
       <head>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />

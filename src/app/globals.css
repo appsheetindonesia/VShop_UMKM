@@ -37,6 +37,14 @@
   .chip {
     @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
   }
+  /* Pill aktif navigasi — gaya dipilih admin lewat menu Configurasi
+     (setting nav_pill_style) tanpa edit kode: data-nav-pill di <html>. */
+  .nav-pill-active {
+    @apply bg-brand-100 text-brand-700 shadow-md shadow-brand-200/50;
+  }
+  html[data-nav-pill="solid"] .nav-pill-active {
+    @apply bg-brand-600 text-white shadow-md shadow-brand-600/30;
+  }
 }
 
 /* ====== Cetak / "Save as PDF" — hanya area #invoice-print yang tampil ====== */

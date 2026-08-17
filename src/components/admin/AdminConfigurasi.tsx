@@ -142,16 +142,29 @@ export default function AdminConfigurasi({ initial }: { initial: ConfigurasiInit
                       <span className="chip bg-gray-100 text-gray-500">env</span>
                     )}
                   </span>
-                  <input
-                    type={s.isSecret ? "password" : "text"}
-                    value={values[s.key] ?? ""}
-                    placeholder={s.isSecret ? (s.display || "Belum diisi") : s.display || "Belum diisi"}
-                    onChange={(e) =>
-                      setValues((prev) => ({ ...prev, [s.key]: e.target.value }))
-                    }
-                    className="input mt-1 w-full !py-2 text-sm"
-                    autoComplete="off"
-                  />
+                  {s.key === "nav_pill_style" ? (
+                    <select
+                      value={values[s.key] ?? (s.display || "soft")}
+                      onChange={(e) =>
+                        setValues((prev) => ({ ...prev, [s.key]: e.target.value }))
+                      }
+                      className="input mt-1 w-full !py-2 text-sm"
+                    >
+                      <option value="soft">Soft — biru muda (default)</option>
+                      <option value="solid">Solid — biru pekat</option>
+                    </select>
+                  ) : (
+                    <input
+                      type={s.isSecret ? "password" : "text"}
+                      value={values[s.key] ?? ""}
+                      placeholder={s.isSecret ? (s.display || "Belum diisi") : s.display || "Belum diisi"}
+                      onChange={(e) =>
+                        setValues((prev) => ({ ...prev, [s.key]: e.target.value }))
+                      }
+                      className="input mt-1 w-full !py-2 text-sm"
+                      autoComplete="off"
+                    />
+                  )}
                   <span className="mt-0.5 block text-xs text-gray-400">{s.description}</span>
                   {s.isSecret && (
                     <span className="mt-0.5 block text-xs text-amber-600">

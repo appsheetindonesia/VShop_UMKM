@@ -62,6 +62,7 @@ export const SETTING_DEFS: SettingDef[] = [
   // Lainnya
   { key: "app_url", category: "lainnya", label: "URL Aplikasi (APP_URL)", description: "Dipakai link notifikasi WhatsApp ke halaman riwayat/detail.", isSecret: false, env: "APP_URL" },
   { key: "order_expiry_hours", category: "lainnya", label: "Order Expiry (jam)", description: "Batas pending order & kadaluarsa transaksi Midtrans (default 24).", isSecret: false, env: "ORDER_EXPIRY_HOURS" },
+  { key: "nav_pill_style", category: "lainnya", label: "Gaya Pill Navigasi", description: "Pill aktif di navigasi bawah (toko) & sidebar (admin/merchant): soft = biru muda, solid = biru pekat.", isSecret: false, env: "NAV_PILL_STYLE" },
 ];
 
 export const SETTING_CATEGORIES: Array<{ id: SettingCategory; label: string; icon: string; hint: string }> = [
@@ -128,6 +129,17 @@ export async function ensureSettingsHydrated(): Promise<void> {
 export function getSetting(key: string): string | null {
   const cached = holder().map.get(key);
   return cached ?? envOf(key);
+}
+
+export type NavPillStyle = "soft" | "solid";
+
+/**
+ * Gaya pill aktif navigasi (dibaca layout server → data-nav-pill di <html>,
+ * CSS di globals.css memilih warna; tanpa edit kode via menu Configurasi).
+ * Nilai selain "solid" dianggap "soft" (default).
+ */
+export function navPillStyle(): NavPillStyle {
+  return getSetting("nav_pill_style") === "solid" ? "solid" : "soft";
 }
 
 /** True bila nilai tersimpan (bukan hanya fallback env). */

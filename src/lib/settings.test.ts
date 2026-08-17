@@ -339,3 +339,27 @@ async function encryptOf(plain: string): Promise<string> {
   void lastEncryptInput;
   return out;
 }
+
+describe("navPillStyle — gaya pill navigasi (soft default / solid, tanpa edit kode)", () => {
+  it("tanpa nilai → soft (default)", async () => {
+    delete process.env.NAV_PILL_STYLE;
+    const s = await fresh();
+    expect(s.navPillStyle()).toBe("soft");
+  });
+
+  it("nilai tersimpan 'solid' via updateSetting (setara menu Configurasi) → solid", async () => {
+    delete process.env.NAV_PILL_STYLE;
+    const s = await fresh();
+    await s.updateSetting({ key: "nav_pill_style", value: "solid" });
+    expect(s.navPillStyle()).toBe("solid");
+  });
+
+  it("env NAV_PILL_STYLE=solid → solid; nilai aneh → soft (normalisasi)", async () => {
+    process.env.NAV_PILL_STYLE = "solid";
+    const s = await fresh();
+    expect(s.navPillStyle()).toBe("solid");
+    process.env.NAV_PILL_STYLE = "neon";
+    expect(s.navPillStyle()).toBe("soft");
+    delete process.env.NAV_PILL_STYLE;
+  });
+});
