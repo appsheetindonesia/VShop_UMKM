@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { getInvoiceNumber } from "@/lib/payment-history";
 import { getSessionUser } from "@/lib/auth";
 import { getActiveMembership, getOrder, getWallet } from "@/lib/service";
 import { formatDateLong, formatRupiah } from "@/lib/format";
@@ -19,6 +20,7 @@ export default function SuksesPage({ searchParams }: { searchParams?: { order?: 
 
   const membership = getActiveMembership(user.id);
   const wallet = getWallet(user.id);
+  const invoiceNumber = getInvoiceNumber(order);
 
   return (
     <div className="mx-auto max-w-md">
@@ -29,7 +31,10 @@ export default function SuksesPage({ searchParams }: { searchParams?: { order?: 
           </span>
           <h1 className="mt-3 text-xl font-bold">Pembayaran Anda Berhasil</h1>
           <p className="mt-1 text-sm text-emerald-50">
-            No. Order: <strong>{order.orderNumber}</strong>
+            No. Invoice: <strong>{invoiceNumber}</strong>
+          </p>
+          <p className="mt-0.5 text-xs text-emerald-200">
+            No. Order: {order.orderNumber}
           </p>
         </div>
 
@@ -95,6 +100,13 @@ export default function SuksesPage({ searchParams }: { searchParams?: { order?: 
           </>
         )}
       </div>
+
+      <Link
+        href={`/transaksi/${order.id}`}
+        className="mt-4 block text-center text-sm font-medium text-brand-600 hover:text-brand-700"
+      >
+        Lihat Detail Transaksi & Unduh Invoice
+      </Link>
     </div>
   );
 }

@@ -89,9 +89,14 @@ async function checkout(cookie) {
 }
 
 async function pollStatus(cookie, orderId, timeoutMs = 15 * 60 * 1000) {
+  // ?reconcile=1 → fallback Status API: webhook tidak bisa menjangkau
+  // localhost, jadi e2e ini bergantung pada reconcile untuk mendeteksi
+  // settlement (di produksi webhook adalah sumber utama).
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const res = await fetch(`${APP_URL}/api/pay/${orderId}/status`, { headers: { Cookie: cookie } }).then(j);
+    const res = await fetch(`${APP_URL}/api/pay/${orderId}/status?reconcile=1`, {
+      headers: { Cookie: cookie },
+    }).then(j);
     if (res?.status === "paid" || res?.status === "failed" || res?.status === "expired") return res;
     await new Promise((r) => setTimeout(r, 5000));
   }

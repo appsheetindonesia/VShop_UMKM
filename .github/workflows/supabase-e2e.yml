@@ -1,0 +1,77 @@
+name: Supabase Local E2E
+
+# Menjalankan Supabase lokal (Docker) di runner lalu mengeksekusi uji keamanan
+# end-to-end: RLS + Storage + Auth phone (scripts/e2e-rls.mjs via `npm run
+# db:rls`) dan alur login WhatsApp (scripts/e2e-auth.mjs, self-contained —
+# mock Supabase + Next.js, tanpa Docker).
+#
+# Kapan dijalankan: push ke main & setiap pull request (sama dengan ci.yml).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  supabase-e2e:
+    name: RLS + Storage + Auth phone (Supabase lokal)
+    runs-on: ubuntu-latest
+    # Pull image Supabase pertama kali butuh beberapa menit.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Supabase CLI
+        # Pin CLI lewat PATH — scripts memakai `npx --yes supabase` yang akan
+        # memakai binary ini (bukan mengunduh versi lain).
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start Supabase local stack
+        # GitHub-hosted runner sudah punya Docker. `supabase start` mengaplikasikan
+        # supabase/migrations/ + supabase/seed.sql (paket langganan).
+        run: supabase start
+
+      - name: Write .env.local + seed akun demo
+        # --skip-start: stack sudah jalan; hanya baca kredensial dari
+        # `supabase status -o env`, tulis .env.local (MERGE), lalu jalankan
+        # scripts/seed-supabase.mjs (user auth phone demo: customer@vshop.id,
+        # merchant@vshop.id + [auth.sms.test_otp]).
+        run: npm run db:setup -- --skip-start
+
+      - name: e2e RLS + Storage + Auth phone
+        # 61 cek: policy RLS 12 tabel (anon/authenticated/service_role),
+        # bucket storage 'vshop-assets' per role, OTP test_otp + phone+password.
+        run: npm run db:rls
+
+  auth-e2e:
+    name: Login WhatsApp e2e (mock Supabase)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: WhatsApp login e2e
+        # Self-contained: menyalakan mock Supabase (Auth + PostgREST) + aplikasi
+        # Next.js (dev), menguji daftar nomor E.164, login phone+password, dan
+        # renew sesi via middleware — tidak butuh Docker/Supabase nyata.
+        run: node scripts/e2e-auth.mjs

@@ -22,9 +22,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# local env files
-.env*.local
+# env files — jangan pernah commit rahasia (rahasia di .env.*)
+# Varian ini bisa dibuat oleh Next.js / Vercel / CI saat deploy:
+#   .env, .env.local, .env.development, .env.production, .env.test,
+#   .env.staging, .env.*.local — semuanya dikecualikan.
 .env
+.env.*
+!.env.example
 
 # vercel
 .vercel

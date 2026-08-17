@@ -29,14 +29,20 @@ import { getSupabaseAdmin, isSupabaseConfigured } from "./supabase/server";
  *
  * 2. MODE DEMO — fallback bila Supabase tidak dikonfigurasi atau tidak
  *    terjangkau. Data disimpan sebagai satu file JSON di <cwd>/data/db.json
- *    dan di-seed otomatis saat pertama kali dijalankan.
+ *    dan di-seed otomatis saat pertama kali dijalankan. Tulis file di-DEBOUNCE:
+ *    banyak `mutate()` berurutan dalam satu tick → maksimal SATU tulis file
+ *    (pola batch+flush, snapshot terbaru menang), mirip koalesensi Supabase.
  *
  * Antarmuka operasi bisnis tetap sama melalui `src/lib/service.ts`.
  */
 
 export type StoreMode = "supabase" | "json";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// Override `VSHOP_DATA_DIR` (mis. untuk pengujian di direktori temp) —
+// default: <cwd>/data.
+const DATA_DIR = process.env.VSHOP_DATA_DIR
+  ? path.resolve(process.env.VSHOP_DATA_DIR)
+  : path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
 // State store (cache + mode + promise hydrate) disimpan di **globalThis** —
@@ -510,6 +516,13 @@ function loadJsonDB(): DB {
   return S.cache;
 }
 
+/** Jumlah tulis file JSON mode demo (seumur proses) — observability & test debounce. */
+let jsonWriteCount = 0;
+
+export function getJsonWriteCount(): number {
+  return jsonWriteCount;
+}
+
 function writeJson(db: DB): void {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -519,12 +532,51 @@ function writeJson(db: DB): void {
     const tmp = `${DB_FILE}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
     fs.renameSync(tmp, DB_FILE);
+    jsonWriteCount++;
   } catch (err) {
     console.error(
       "[db] Gagal menulis data/db.json:",
       err instanceof Error ? err.message : err
     );
   }
+}
+
+/**
+ * DEBOUNCE tulis JSON (mode demo) — pola batch+flush yang sama dengan
+ * write-through Supabase: banyak `mutate()` berurutan dalam SATU tick
+ * menghasilkan MAKSIMAL SATU tulis file, memakai snapshot terbaru (full
+ * snapshot — tulis yang masih menunggu dilewati). Rantai promise menjaga
+ * urutan antar tick; mutasi yang masuk saat tulis belum berjalan cukup
+ * menandai flush yang sama.
+ */
+let jsonWriteScheduled = false;
+let jsonChain: Promise<void> = Promise.resolve();
+
+function enqueueJsonWrite(): Promise<void> {
+  // `JSON_DEBOUNCE=0` mematikan debounce: setiap `mutate()` menulis file
+  // LANGSUNG (tidak menunggu akhir tick) — dipakai alat ukur perbandingan
+  // (scripts/measure-json-writes.test.ts) untuk mengukur penghematan I/O
+  // debounce secara empiris. Hanya mode demo (JSON); jangan dipakai selain
+  // untuk mengukur/mendebug.
+  if (process.env.JSON_DEBOUNCE === "0") {
+    const S = sharedState();
+    if (S.cache) writeJson(S.cache);
+    return jsonChain;
+  }
+  if (jsonWriteScheduled) return jsonChain;
+  jsonWriteScheduled = true;
+  const run = jsonChain.then(() => {
+    jsonWriteScheduled = false;
+    const S = sharedState();
+    if (S.cache) writeJson(S.cache);
+  });
+  jsonChain = run.catch((err) =>
+    console.error(
+      "[db] Gagal menulis data/db.json:",
+      err instanceof Error ? err.message : err
+    )
+  );
+  return jsonChain;
 }
 
 /**
@@ -538,6 +590,10 @@ export async function initDB(): Promise<void> {
   if (!isSupabaseConfigured()) {
     S.storeMode = "json";
     loadJsonDB();
+    console.log(
+      `[db] mode: DEMO (JSON) — Supabase tidak dikonfigurasi. ` +
+        `File: ${DB_FILE} (tulis sejak start: ${jsonWriteCount})`
+    );
     return;
   }
   try {
@@ -551,6 +607,9 @@ export async function initDB(): Promise<void> {
     );
     S.storeMode = "json";
     loadJsonDB();
+    console.log(
+      `[db] mode: DEMO (JSON) — fallback. File: ${DB_FILE} (tulis sejak start: ${jsonWriteCount})`
+    );
   }
 }
 
@@ -649,12 +708,62 @@ function captureCollections(db: DB): Record<CollectionKey, string> {
  */
 let pendingWrite: { snapshot: DB; keys: Set<CollectionKey> } | null = null;
 
+// Observabilitas antrean/drain — dipakai endpoint `/api/health`.
+let lastFlushAt: string | null = null;
+let lastFlushDurationMs: number | null = null;
+let lastFlushStartedAt: number | null = null;
+
+/** Catat penyelesaian satu flush (waktu + durasi) untuk /api/health. */
+function recordFlush(): void {
+  lastFlushAt = new Date().toISOString();
+  lastFlushDurationMs =
+    lastFlushStartedAt === null ? null : Date.now() - lastFlushStartedAt;
+}
+
 /** Flush batch pending (bila ada) — satu tugas per batch. */
 async function flushPendingWrite(): Promise<void> {
   const job = pendingWrite;
   pendingWrite = null; // tulis yang masuk selama flush berjalan → batch baru
   if (!job) return;
-  await writeCollectionsToSupabase(job.snapshot, Array.from(job.keys));
+  lastFlushStartedAt = Date.now();
+  try {
+    await writeCollectionsToSupabase(job.snapshot, Array.from(job.keys));
+  } finally {
+    recordFlush();
+  }
+}
+
+/**
+ * Status antrean tulis untuk /api/health: apakah ada batch yang belum
+ * ter-flush, koleksi apa yang menunggu, apakah drain shutdown terdaftar,
+ * dan kapan flush terakhir selesai (dipakai memantau drain saat shutdown).
+ */
+export interface PersistQueueInfo {
+  storeMode: StoreMode;
+  hydrated: boolean;
+  pendingBatches: number;
+  pendingCollections: CollectionKey[];
+  drainRegistered: boolean;
+  lastFlushAt: string | null;
+  lastFlushDurationMs: number | null;
+  /** Jumlah tulis file JSON mode demo (0 di mode Supabase). */
+  jsonWriteCount: number;
+}
+
+export function getPersistQueueInfo(): PersistQueueInfo {
+  const S = sharedState();
+  return {
+    storeMode: S.storeMode,
+    hydrated: S.cache !== null,
+    pendingBatches: pendingWrite ? 1 : 0,
+    pendingCollections: pendingWrite ? Array.from(pendingWrite.keys) : [],
+    drainRegistered: globalThis.__vshopShutdownFlush === true,
+    lastFlushAt,
+    lastFlushDurationMs,
+    // Tulis file JSON mode demo (0 di mode Supabase) — observability
+    // operasional: "demo JSON — N tulis sejak start".
+    jsonWriteCount,
+  };
 }
 
 /**
@@ -664,7 +773,25 @@ async function flushPendingWrite(): Promise<void> {
  * rantai promise; tulis yang sedang berjalan tidak bisa di-dedupe.
  */
 function enqueueWrite(snapshot: DB, keys: CollectionKey[]): Promise<void> {
-  if (pendingWrite) {
+  // `DB_COALESCE=0` mematikan penggabungan batch: setiap `mutate()` mendapat
+  // flush SENDIRI untuk koleksi dirty-nya (batch dikunci — tidak dilewati /
+  // ditimpa mutate berikutnya, tulis lama tidak di-dedupe). Dipakai alat ukur
+  // perbandingan (scripts/measure-writes.test.ts) & regresi; default =
+  // koalesensi aktif.
+  if (process.env.DB_COALESCE === "0") {
+    const run = persistChain.then(() => {
+      lastFlushStartedAt = Date.now();
+      return writeCollectionsToSupabase(snapshot, Array.from(keys)).finally(
+        recordFlush
+      );
+    });
+    persistChain = run.catch((err) =>
+      console.error(
+        "[db] Gagal menulis ke Supabase:",
+        err instanceof Error ? err.message : err
+      )
+    );
+  } else if (pendingWrite) {
     // Gabung ke batch yang belum ter-flush: snapshot terbaru menang,
     // kunci digabung (Set) sehingga tiap koleksi hanya ditulis sekali.
     pendingWrite.snapshot = snapshot;
@@ -682,14 +809,14 @@ function enqueueWrite(snapshot: DB, keys: CollectionKey[]): Promise<void> {
   return persistChain;
 }
 
-/** Tulis hanya koleksi yang berubah (Supabase) / tulis file JSON (demo). */
+/** Tulis hanya koleksi yang berubah (Supabase) / tulis file JSON (demo, debounce). */
 function writeDirty(keys: CollectionKey[]): void {
   const S = sharedState();
   if (!S.cache) return;
   if (S.storeMode === "supabase") {
     void enqueueWrite(structuredClone(S.cache), keys);
   } else {
-    writeJson(S.cache);
+    void enqueueJsonWrite();
   }
 }
 
@@ -702,10 +829,150 @@ export function persist(): Promise<void> {
   const S = sharedState();
   if (!S.cache) return Promise.resolve();
   if (S.storeMode === "supabase") {
-    return enqueueWrite(structuredClone(S.cache), [...COLLECTION_KEYS]);
+    return enqueueFullFlush();
   }
   writeJson(S.cache);
   return Promise.resolve();
+}
+
+/**
+ * Full flush ter-debounce (mode Supabase): beberapa panggilan `persist()`
+ * yang memicu bersamaan — mis. beberapa job cron yang jalan hampir serentak
+ * (masing-masing request punya event-loop turn sendiri, jadi tidak tergabung
+ * lewat pendingWrite) — digabung jadi SATU tulis dengan snapshot TERBARU
+ * (diambil saat flush berjalan, bukan saat permintaan), bukan N full flush
+ * yang menumpuk 12 koleksi × N request.
+ *
+ * Urutan tetap terjaga via persistChain: full flush yang dijadwalkan selalu
+ * berjalan SETELAH batch mutate yang sudah mengantre, dan `await persist()`
+ * tetap menunggu sampai tulis selesai (kontrak sinkronisasi eksplisit).
+ */
+let fullFlushPending = false;
+
+function enqueueFullFlush(): Promise<void> {
+  const S = sharedState();
+  if (!S.cache) return Promise.resolve();
+  // Ada batch (mutate/persist) yang belum ter-flush → gabung: snapshot
+  // TERBARU + SEMUA koleksi (perilaku lama persist: batch jadi full flush).
+  if (pendingWrite) {
+    pendingWrite.snapshot = structuredClone(S.cache);
+    for (const key of COLLECTION_KEYS) pendingWrite.keys.add(key);
+    return persistChain;
+  }
+  // Full flush sudah dijadwalkan / sedang berjalan → tunggu chain saja,
+  // JANGAN enqueue batch baru (debounce antar panggilan bersamaan). Flag
+  // dibuka SETELAH tulis selesai agar panggilan yang tiba saat flush
+  // in-flight ikut ter-coalesce.
+  if (fullFlushPending) return persistChain;
+  fullFlushPending = true;
+  const run = persistChain.then(async () => {
+    try {
+      const s = sharedState();
+      if (s.cache) await writeAllToSupabase(s.cache);
+    } finally {
+      // Selalu buka debounce — walau tulis gagal, persist() berikutnya tetap
+      // bisa menjadwalkan full flush baru.
+      fullFlushPending = false;
+    }
+  });
+  persistChain = run.catch((err) =>
+    console.error(
+      "[db] Gagal menulis ke Supabase:",
+      err instanceof Error ? err.message : err
+    )
+  );
+  return persistChain;
+}
+
+/**
+ * FLUSH PAKSA dengan batas waktu (max wait): tunggu seluruh antrean tulis
+ * yang sedang berjalan / masih menunggu selesai, tapi TIDAK lebih dari
+ * `maxWaitMs` — kalau lewat, resolve dengan peringatan (snapshot mungkin
+ * belum tersimpan) alih-alih menggantung proses.
+ *
+ * Dipakai drain terakhir saat shutdown (SIGTERM/SIGINT) agar snapshot
+ * TERBARU dari batch yang belum ter-flush tidak hilang bila server berhenti
+ * di tengah antrean, dan titik sinkronisasi eksplisit untuk pemanggil yang
+ * butuh kepastian tulis (mis. sebelum proses keluar). Tidak pernah melempar;
+ * mode demo (JSON): menuntaskan tulis yang masih terjadwal (debounce) atau
+ * menulis langsung bila tidak ada yang menunggu — tanpa tulis ganda.
+ */
+export function flushNow(maxWaitMs = 5_000): Promise<void> {
+  const S = sharedState();
+  if (!S.cache) return Promise.resolve();
+  if (S.storeMode === "json") {
+    // Debounce aktif: kalau tulis masih dijadwalkan, tuntaskan lewat rantai
+    // (satu tulis); kalau tidak ada yang menunggu, tulis sekarang.
+    if (jsonWriteScheduled) return jsonChain;
+    writeJson(S.cache);
+    return Promise.resolve();
+  }
+  // Nudge: bila masih ada batch yang belum dijadwalkan ke antrean, jadwalkan
+  // sekarang (no-op bila flush untuk batch itu sudah berjalan — run kedua
+  // menemukan pendingWrite kosong). Menjamin apa pun yang menunggu ikut
+  // ditunggu di bawah.
+  if (pendingWrite) {
+    const run = persistChain.then(() => flushPendingWrite());
+    persistChain = run.catch((err) =>
+      console.error(
+        "[db] Gagal menulis ke Supabase:",
+        err instanceof Error ? err.message : err
+      )
+    );
+  }
+  const chain = persistChain;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.warn(
+        `[db] flushNow: timeout ${maxWaitMs}ms — snapshot terbaru mungkin belum tersimpan`
+      );
+      resolve();
+    }, maxWaitMs);
+    chain.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      }
+    );
+  });
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __vshopShutdownFlush: boolean | undefined;
+}
+
+/**
+ * DRAIN TERAKHIR + exit: `flushNow` dengan batas waktu sebelum proses
+ * keluar, sehingga snapshot terbaru yang masih mengantre di persistChain
+ * tidak hilang. Jalur TUNGGAL yang dipakai oleh (1) sinyal SIGTERM/SIGINT
+ * (`registerShutdownFlush`) dan (2) endpoint `POST /api/dev/shutdown` —
+ * Windows tidak bisa mengirim sinyal yang bisa ditangkap ke proses
+ * detached, jadi `npm run stop:dev` memakai endpoint ini agar drain tetap
+ * benar-benar diuji saat server dimatikan secara normal.
+ *
+ * Batas waktu default bisa di-override lewat env `DB_FLUSH_MAX_WAIT_MS`.
+ */
+export function drainAndExit(): void {
+  const maxWait = Number(process.env.DB_FLUSH_MAX_WAIT_MS ?? 5_000);
+  console.log(`[db] shutdown: drain terakhir (maks ${maxWait}ms)`);
+  void flushNow(maxWait).finally(() => process.exit(0));
+}
+
+/**
+ * Daftarkan DRAIN TERAKHIR saat proses menerima SIGTERM/SIGINT (shutdown
+ * graceful). Guard `globalThis` mencegah pendaftaran ganda (root layout
+ * dipanggil per request; scheduler cron juga memakai pola ini).
+ */
+export function registerShutdownFlush(): void {
+  if (globalThis.__vshopShutdownFlush) return;
+  globalThis.__vshopShutdownFlush = true;
+  process.once("SIGTERM", drainAndExit);
+  process.once("SIGINT", drainAndExit);
 }
 
 /**
@@ -727,7 +994,7 @@ export function mutate<T>(fn: (db: DB) => T): T {
     }
     if (dirty.length > 0) void enqueueWrite(structuredClone(db), dirty);
   } else {
-    writeJson(db);
+    void enqueueJsonWrite();
   }
   return result;
 }
@@ -858,10 +1125,22 @@ function claimFromRow(r: Row): ClaimedVoucher {
     claimedAt: String(r.claimedAt),
     usedAt: r.usedAt ? String(r.usedAt) : undefined,
     useCount: Number(r.useCount ?? 0),
+    expiringNotifiedAt: r.expiringNotifiedAt ? String(r.expiringNotifiedAt) : undefined,
+    expiring24hNotifiedAt: r.expiring24hNotifiedAt ? String(r.expiring24hNotifiedAt) : undefined,
   };
 }
 
 function orderFromRow(r: Row): Order {
+  const metadata = ((r.metadata as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+  // Riwayat retry tersimpan juga di kolom (migration 0002) — gabungkan ke
+  // metadata saat hydrate (kolom menang bila ada; metadata lama tetap
+  // dipertahankan untuk kompatibilitas baris sebelum migration).
+  const originalNumber = r.originalOrderNumber ? String(r.originalOrderNumber) : undefined;
+  const prevNumbers = Array.isArray(r.previousOrderNumbers)
+    ? (r.previousOrderNumbers as string[])
+    : undefined;
+  if (originalNumber) metadata.originalOrderNumber = originalNumber;
+  if (prevNumbers && prevNumbers.length > 0) metadata.previousOrderNumbers = prevNumbers;
   return {
     id: String(r.id),
     orderNumber: String(r.orderNumber),
@@ -874,7 +1153,7 @@ function orderFromRow(r: Row): Order {
     paymentMethod: r.paymentMethod ? String(r.paymentMethod) : undefined,
     snapToken: r.snapToken ? String(r.snapToken) : undefined,
     shippingAddress: r.shippingAddress ? (r.shippingAddress as Order["shippingAddress"]) : undefined,
-    metadata: (r.metadata as Record<string, unknown>) ?? {},
+    metadata,
     createdAt: String(r.createdAt),
     paidAt: r.paidAt ? String(r.paidAt) : undefined,
   };
@@ -945,11 +1224,11 @@ async function hydrateFromSupabase(): Promise<DB> {
       ).then((rs) => rs.map(voucherFromRow)),
       fetchRows(
         "claimed_vouchers",
-        "id,voucherId:voucher_id,userId:user_id,kode,kodeKonfirmasi:kode_konfirmasi,status,claimedAt:claimed_at,usedAt:used_at,useCount:use_count"
+        "id,voucherId:voucher_id,userId:user_id,kode,kodeKonfirmasi:kode_konfirmasi,status,claimedAt:claimed_at,usedAt:used_at,useCount:use_count,expiringNotifiedAt:expiring_notified_at,expiring24hNotifiedAt:expiring_24h_notified_at"
       ).then((rs) => rs.map(claimFromRow)),
       fetchRows(
         "orders",
-        "id,orderNumber:order_number,userId:user_id,type,items,totalAmount:total_amount,status,paymentStatus:payment_status,paymentMethod:payment_method,snapToken:snap_token,shippingAddress:shipping_address,metadata,createdAt:created_at,paidAt:paid_at"
+        "id,orderNumber:order_number,userId:user_id,type,items,totalAmount:total_amount,status,paymentStatus:payment_status,paymentMethod:payment_method,snapToken:snap_token,shippingAddress:shipping_address,metadata,createdAt:created_at,paidAt:paid_at,originalOrderNumber:original_order_number,previousOrderNumbers:previous_order_numbers"
       ).then((rs) => rs.map(orderFromRow)),
       fetchRows(
         "merchandise",
@@ -1107,27 +1386,44 @@ const COLLECTION_WRITERS: Record<CollectionKey, CollectionWriter> = {
         claimed_at: c.claimedAt,
         used_at: c.usedAt ?? null,
         use_count: c.useCount,
+        expiring_notified_at: c.expiringNotifiedAt ?? null,
+        expiring_24h_notified_at: c.expiring24hNotifiedAt ?? null,
       }))
     ),
   orders: (db) =>
     writeTable(
       "orders",
-      db.orders.map((o) => ({
-        id: o.id,
-        order_number: o.orderNumber,
-        user_id: o.userId,
-        type: o.type,
-        items: o.items,
-        total_amount: o.totalAmount,
-        status: o.status,
-        payment_status: o.paymentStatus,
-        payment_method: o.paymentMethod ?? null,
-        snap_token: o.snapToken ?? null,
-        shipping_address: o.shippingAddress ?? null,
-        metadata: o.metadata ?? {},
-        created_at: o.createdAt,
-        paid_at: o.paidAt ?? null,
-      }))
+      db.orders.map((o) => {
+        const meta = (o.metadata ?? {}) as Record<string, unknown>;
+        // Riwayat retry disalin dari metadata ke KOLOM (migration 0002).
+        const original =
+          typeof meta.originalOrderNumber === "string" && meta.originalOrderNumber
+            ? meta.originalOrderNumber
+            : null;
+        const prev =
+          Array.isArray(meta.previousOrderNumbers) &&
+          (meta.previousOrderNumbers as unknown[]).length > 0
+            ? (meta.previousOrderNumbers as string[])
+            : null;
+        return {
+          id: o.id,
+          order_number: o.orderNumber,
+          user_id: o.userId,
+          type: o.type,
+          items: o.items,
+          total_amount: o.totalAmount,
+          status: o.status,
+          payment_status: o.paymentStatus,
+          payment_method: o.paymentMethod ?? null,
+          snap_token: o.snapToken ?? null,
+          shipping_address: o.shippingAddress ?? null,
+          metadata: o.metadata ?? {},
+          created_at: o.createdAt,
+          paid_at: o.paidAt ?? null,
+          original_order_number: original,
+          previous_order_numbers: prev,
+        };
+      })
     ),
   merchandise: (db) =>
     writeTable(

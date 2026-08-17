@@ -13,6 +13,21 @@
  */
 
 import { createHash } from "node:crypto";
+import { getSetting } from "./settings";
+// SUMBER SATU-SATUNYA tabel kode gagal ada di file data murni
+// `./midtrans-codes` (dipakai ulang oleh halaman admin & unit test).
+// Di-import untuk logika lokal + di-re-export agar import lama
+// `from "@/lib/midtrans"` tetap bekerja.
+import {
+  CHANNEL_LABEL,
+  CHANNEL_RESPONSE_CODES,
+  MIDTRANS_FAILURE_CODES,
+} from "./midtrans-codes";
+export {
+  CHANNEL_LABEL,
+  CHANNEL_RESPONSE_CODES,
+  MIDTRANS_FAILURE_CODES,
+} from "./midtrans-codes";
 
 export interface PaymentTransaction {
   orderId: string;
@@ -32,31 +47,51 @@ export interface PaymentResult {
 const IS_PRODUCTION = process.env.MIDTRANS_IS_PRODUCTION === "true";
 
 /**
- * Base URL Midtrans (seam pengujian). Bila MIDTRANS_API_BASE diisi,
- * dipakai untuk Snap v1 & Status v2 (mis. mengarah ke simulator lokal /
- * proxy). Tanpa override: sandbox / produksi sesuai MIDTRANS_IS_PRODUCTION.
+ * Base URL Midtrans (seam pengujian & override admin). Prioritas:
+ * 1. Setting admin `midtrans_api_base` (Configurasi — bisa diubah tanpa
+ *    restart, mis. mengarah ke simulator/proxy lokal);
+ * 2. env MIDTRANS_API_BASE;
+ * 3. sandbox / produksi sesuai MIDTRANS_IS_PRODUCTION.
+ * Dibaca PER PANGGILAN (bukan konstanta module-load) agar perubahan setting
+ * berlaku live — pola yang sama dgn serverKey()/clientKey().
  */
-const OVERRIDE_API_BASE = process.env.MIDTRANS_API_BASE;
-const SNAP_BASE =
-  OVERRIDE_API_BASE ??
-  (IS_PRODUCTION
-    ? "https://app.midtrans.com/snap/v1"
-    : "https://app.sandbox.midtrans.com/snap/v1");
-const STATUS_BASE =
-  OVERRIDE_API_BASE ??
-  (IS_PRODUCTION
-    ? "https://api.midtrans.com/v2"
-    : "https://api.sandbox.midtrans.com/v2");
+function apiBase(): string | undefined {
+  return getSetting("midtrans_api_base") ?? process.env.MIDTRANS_API_BASE ?? undefined;
+}
+
+function snapBase(): string {
+  return (
+    apiBase() ??
+    (IS_PRODUCTION ? "https://app.midtrans.com/snap/v1" : "https://app.sandbox.midtrans.com/snap/v1")
+  );
+}
+
+function statusBase(): string {
+  return (
+    apiBase() ??
+    (IS_PRODUCTION ? "https://api.midtrans.com/v2" : "https://api.sandbox.midtrans.com/v2")
+  );
+}
 
 /**
  * Masa berlaku order & transaksi Midtrans (jam). Satu sumber kebenaran:
  * dipakai untuk field `expiry` di payload Snap DAN aturan auto-expire order
  * lokal (cron) — keduanya selalu konsisten. Default 24 jam (default Snap).
+ *
+ * Dibaca PER PANGGILAN (bukan konstanta module-load) sehingga perubahan
+ * langsung berlaku tanpa restart: setting admin "Order Expiry (jam)" di
+ * Configurasi menang (cache di-refresh saat simpan), fallback env
+ * `ORDER_EXPIRY_HOURS` (dev server / CI). Nilai tidak valid (NaN, ≤ 0)
+ * jatuh kembali ke default 24.
  */
-export const ORDER_EXPIRY_HOURS = Number(process.env.ORDER_EXPIRY_HOURS ?? 24);
+export function getOrderExpiryHours(): number {
+  const raw = Number(getSetting("order_expiry_hours") ?? 24);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24;
+}
 
 function serverKey(): string | undefined {
-  return process.env.MIDTRANS_SERVER_KEY;
+  // Setting admin (Configurasi) menang; fallback env MIDTRANS_SERVER_KEY.
+  return getSetting("midtrans_server_key") ?? undefined;
 }
 
 /**
@@ -72,7 +107,7 @@ export async function createPaymentTransaction(
     return { token: `snap-demo-${tx.orderId}`, mock: true };
   }
 
-  const res = await fetch(`${SNAP_BASE}/transactions`, {
+  const res = await fetch(`${snapBase()}/transactions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -83,7 +118,7 @@ export async function createPaymentTransaction(
       transaction_details: {
         order_id: tx.orderNumber,
         gross_amount: tx.totalAmount,
-        expiry: { unit: "hours", duration: ORDER_EXPIRY_HOURS },
+        expiry: { unit: "hours", duration: getOrderExpiryHours() },
       },
       customer_details: {
         first_name: tx.customerName?.split(" ")[0] ?? "Customer",
@@ -105,7 +140,8 @@ export async function createPaymentTransaction(
 }
 
 export function midtransClientKey(): string | undefined {
-  return process.env.MIDTRANS_CLIENT_KEY;
+  // Setting admin (Configurasi) menang; fallback env MIDTRANS_CLIENT_KEY.
+  return getSetting("midtrans_client_key") ?? undefined;
 }
 
 /** True bila token Snap berasal dari mode demo (bukan Midtrans asli). */
@@ -165,20 +201,61 @@ interface MidtransStatus {
   gross_amount?: string;
   status_message?: string;
   transaction_id?: string;
+  /** Kode respons dari CHANNEL (GoPay/OVO/VA/bank) — lebih spesifik dari status_code. */
+  channel_response_code?: string;
+  /** Pesan mentah dari channel. */
+  channel_response_message?: string;
 }
 
-/** Ambil status transaksi dari Midtrans Status API (server-to-server). */
+/**
+ * Error ter-struktur dari panggilan Midtrans API — membawa `statusCode`
+ * (mis. "401") dan potongan body agar pemanggil bisa membedakan error
+ * KONFIGURASI (401/402/410) dari error transaksi biasa.
+ */
+export class MidtransApiError extends Error {
+  readonly statusCode: string;
+  readonly body: string;
+  constructor(statusCode: number | string, body: string) {
+    super(`Midtrans status error ${statusCode}: ${body.slice(0, 200)}`);
+    this.name = "MidtransApiError";
+    this.statusCode = String(statusCode);
+    this.body = body;
+  }
+}
+
+/**
+ * Ambil status transaksi dari Midtrans Status API (server-to-server).
+ * Error non-2xx dilempar sebagai `MidtransApiError` (bawa statusCode).
+ */
 export async function getMidtransStatus(orderNumber: string): Promise<MidtransStatus> {
   const key = serverKey();
   if (!key) throw new Error("MIDTRANS_SERVER_KEY belum diatur");
-  const res = await fetch(`${STATUS_BASE}/${encodeURIComponent(orderNumber)}/status`, {
+  const res = await fetch(`${statusBase()}/${encodeURIComponent(orderNumber)}/status`, {
     headers: { Authorization: `Basic ${Buffer.from(`${key}:`).toString("base64")}` },
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Midtrans status error ${res.status}: ${body.slice(0, 200)}`);
+    throw new MidtransApiError(res.status, body);
   }
   return (await res.json()) as MidtransStatus;
+}
+
+/**
+ * True bila status_code adalah error KONFIGURASI pembayaran (bukan kegagalan
+ * transaksi pelanggan): 401 akses ditolak (key salah), 402 metode tidak
+ * tersedia untuk merchant, 403 konten ditolak, 410 akun merchant nonaktif.
+ * Dipakai untuk memicu notifikasi ke merchant (lihat route Status API).
+ */
+export function isMidtransConfigError(statusCode?: string): boolean {
+  switch (statusCode?.trim()) {
+    case "401":
+    case "402":
+    case "403":
+    case "410":
+      return true;
+    default:
+      return false;
+  }
 }
 
 /** True bila transaksi sudah dibayar (capture/settlement tanpa challenge). */
@@ -210,95 +287,15 @@ export function midtransTerminalFailure(
   }
 }
 
-/**
- * Tabel status_code Midtrans → alasan gagal spesifik (Bahasa Indonesia).
- *
- * 2xx = kode status pembayaran (kartu / bank transfer / e-channel /
- * convenience store / QRIS / e-wallet). 4xx = kode status Midtrans dari
- * Status API / pembuatan transaksi (bukan kode channel) — bisa muncul saat
- * transaksi bermasalah (mis. 407 transaksi sudah kedaluwarsa, 406 nomor
- * order sudah dipakai, 401/402 salah konfigurasi merchant).
- *
- * Sumber: docs.midtrans.com/reference/status-code (Code 2xx & Code 4xx).
- * Diekspor agar unit test bisa menguji SELURUH tabel (tidak boleh ada
- * kode yang terlewat).
- */
-export const MIDTRANS_FAILURE_CODES: Readonly<Record<string, string>> = {
-  // Kartu kredit
-  "101": "Kartu kedaluwarsa",
-  "102": "Kartu ditolak oleh bank",
-  "103": "Saldo kartu tidak mencukupi",
-  "104": "Kartu diblokir karena dugaan penipuan",
-  "105": "Kartu tidak aktif",
-  "106": "Melebihi limit transaksi",
-  "107": "Kartu diblokir oleh bank",
-  "108": "Nomor kartu tidak valid",
-  "109": "Tanggal kedaluwarsa kartu tidak valid",
-  "110": "Kode CVV tidak valid",
-  "111": "Jenis kartu tidak didukung",
-  "112": "Kartu ditolak saat verifikasi 3DS",
-  "113": "Kartu ditolak oleh bank saat verifikasi 3DS",
-  "114": "Saldo kartu tidak mencukupi saat verifikasi 3DS",
-  "115": "Kartu diblokir oleh bank saat verifikasi 3DS",
-  "116": "Melebihi limit transaksi saat verifikasi 3DS",
-  "117": "Kartu tidak valid saat verifikasi 3DS",
-  "118": "Kartu kedaluwarsa saat verifikasi 3DS",
-  "119": "Kode CVV tidak valid saat verifikasi 3DS",
-  "188": "Kartu belum terdaftar 3DS",
-  // Umum / bank transfer / e-channel / retail
-  "201": "Pembayaran dibatalkan",
-  "202": "Pembayaran ditolak oleh bank",
-  "203": "Waktu pembayaran habis",
-  "204": "Pembayaran ditolak oleh bank",
-  "205": "Pembayaran ditolak oleh bank",
-  "206": "Pembayaran ditolak oleh bank",
-  "207": "Transaksi ditolak karena dugaan penipuan",
-  "208": "Pembayaran ditolak oleh bank",
-  "209": "Pembayaran ditolak oleh penyedia",
-  "210": "Pembayaran ditolak oleh bank",
-  "211": "Pembayaran ditolak oleh penerbit",
-  "212": "Pembayaran ditolak oleh bank",
-  "213": "Jumlah transaksi tidak sesuai",
-  // QRIS
-  "214": "QRIS gagal diproses",
-  "215": "Pembayaran ditolak oleh bank (QRIS)",
-  "216": "Saldo tidak mencukupi (QRIS)",
-  "217": "Pembayaran ditolak oleh bank (QRIS)",
-  "218": "Pembayaran ditolak oleh bank (QRIS)",
-  "219": "Melebihi limit transaksi (QRIS)",
-  "220": "Pembayaran ditolak oleh bank (QRIS)",
-  "221": "Waktu pembayaran QRIS habis",
-  "222": "Pembayaran ditolak oleh bank (QRIS)",
-  "223": "Pembayaran ditolak oleh bank (QRIS)",
-  "224": "Pembayaran ditolak oleh bank (QRIS)",
-  "225": "Pembayaran ditolak oleh bank (QRIS)",
-  "226": "Pembayaran ditolak oleh bank (QRIS)",
-  "227": "Pembayaran ditolak oleh bank (QRIS)",
-  "228": "Pembayaran ditolak oleh bank (QRIS)",
-  "229": "Pembayaran ditolak oleh bank (QRIS)",
-  "230": "Pembayaran ditolak oleh bank (QRIS)",
-  // 4xx — kode status Midtrans (docs: status-code-4xx); bukan kode channel.
-  "400": "Data transaksi tidak valid",
-  "401": "Akses ditolak — periksa konfigurasi kunci Midtrans",
-  "402": "Metode pembayaran tidak tersedia untuk merchant",
-  "403": "Permintaan ditolak (konten tidak sesuai)",
-  "404": "Transaksi tidak ditemukan",
-  "405": "Metode permintaan tidak diizinkan",
-  "406": "Nomor order sudah pernah dipakai",
-  "407": "Transaksi sudah kedaluwarsa",
-  "408": "Tipe data transaksi salah",
-  "410": "Akun merchant nonaktif — hubungi dukungan",
-  "411": "Token transaksi tidak valid atau kedaluwarsa",
-  "412": "Status transaksi tidak dapat diubah",
-  "413": "Format permintaan tidak valid",
-};
-
 const FAILURE_TRANSACTION_MESSAGES: Record<string, string> = {
   expire: "Waktu pembayaran habis",
   deny: "Pembayaran ditolak oleh bank",
   cancel: "Pembayaran dibatalkan",
   failure: "Pembayaran gagal diproses",
 };
+
+// Tabel channel_response_code & CHANNEL_LABEL: lihat `./midtrans-codes`
+// (sumber tunggal; dipakai ulang halaman admin & unit test).
 
 export interface MidtransFailureDetail {
   /** Kode status Midtrans (mis. "202", "216") bila tersedia. */
@@ -308,12 +305,59 @@ export interface MidtransFailureDetail {
 }
 
 /**
+ * Petakan `channel_response_code` (kode dari penyedia channel) ke alasan
+ * spesifik per channel. Mengembalikan null bila tidak ada kode channel atau
+ * channel tidak dikenal. Kode channel yang TIDAK ada di tabel tetap memberi
+ * alasan spesifik-kanal ("Ditolak oleh {channel} (kode …)") — penyebab
+ * persisnya lebih berguna daripada pesan generik 202.
+ */
+export function midtransChannelFailureReason(
+  paymentType?: string,
+  channelCode?: string,
+  channelMessage?: string
+): MidtransFailureDetail | null {
+  const code = channelCode?.trim();
+  const channel = paymentType ? paymentType.trim().toLowerCase() : "";
+  if (!code) return null;
+
+  const table = CHANNEL_RESPONSE_CODES[channel];
+  if (table?.[code]) {
+    return {
+      code,
+      reason: table[code] + (channelMessage ? ` — ${channelMessage.trim()}` : ""),
+    };
+  }
+  // Kanal dikenal tapi kode belum di tabel → tetap spesifik-kanal.
+  const label = CHANNEL_LABEL[channel];
+  if (label) {
+    return {
+      code,
+      reason: `Ditolak oleh ${label} (kode ${code})` + (channelMessage ? ` — ${channelMessage.trim()}` : ""),
+    };
+  }
+  return null;
+}
+
+/**
  * Petakan status Midtrans ke alasan kegagalan spesifik. Mengembalikan null
  * bila status bukan kegagalan terminal (masih berjalan / sudah lunas).
+ *
+ * Prioritas: (1) `channel_response_code` per channel (paling spesifik),
+ * (2) `status_code` Midtrans (tabel 2xx/4xx), (3) fallback `transaction_status`.
  */
 export function midtransFailureReason(
-  status: Pick<MidtransStatus, "status_code" | "transaction_status">
+  status: Pick<
+    MidtransStatus,
+    "status_code" | "transaction_status" | "payment_type" | "channel_response_code" | "channel_response_message"
+  >
 ): MidtransFailureDetail | null {
+  const channel = midtransChannelFailureReason(
+    status.payment_type,
+    status.channel_response_code,
+    status.channel_response_message
+  );
+  if (channel) return channel;
+
   const code = status.status_code?.trim();
   if (code && MIDTRANS_FAILURE_CODES[code]) {
     return { code, reason: MIDTRANS_FAILURE_CODES[code] };

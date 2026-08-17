@@ -44,7 +44,13 @@ export async function POST(req: Request) {
 
   const order = getOrderByNumber(orderId);
 
-  // Data mentah notifikasi ikut direkam ke log audit pembayaran order.
+  // Data mentah notifikasi ikut direkam ke log audit pembayaran order —
+  // termasuk channel_response_code/message (kode spesifik GoPay/OVO/VA).
+  const channelResponseCode =
+    typeof body.channel_response_code === "string" ? body.channel_response_code : undefined;
+  const channelResponseMessage =
+    typeof body.channel_response_message === "string" ? body.channel_response_message : undefined;
+  const paymentType = typeof body.payment_type === "string" ? body.payment_type : undefined;
   const audit = {
     source: "webhook" as const,
     statusCode: statusCode,
@@ -52,7 +58,9 @@ export async function POST(req: Request) {
     transactionStatus:
       typeof body.transaction_status === "string" ? body.transaction_status : undefined,
     transactionId: typeof body.transaction_id === "string" ? body.transaction_id : undefined,
-    paymentType: typeof body.payment_type === "string" ? body.payment_type : undefined,
+    paymentType,
+    channelResponseCode,
+    channelResponseMessage,
     orderNumber: orderId,
   };
 
@@ -88,6 +96,9 @@ export async function POST(req: Request) {
           status_code: typeof body.status_code === "string" ? body.status_code : undefined,
           transaction_status:
             typeof body.transaction_status === "string" ? body.transaction_status : undefined,
+          payment_type: paymentType,
+          channel_response_code: channelResponseCode,
+          channel_response_message: channelResponseMessage,
         })?.reason,
         audit
       );

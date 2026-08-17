@@ -7,9 +7,11 @@ const MAX_SIZE = 2 * 1024 * 1024; // 2MB
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 /**
- * Upload gambar ke Supabase Storage (bucket `vshop-assets`, folder `usaha` /
- * `produk`). Wajib login; file divalidasi tipe & ukuran; akses storage lewat
- * service-role key (server-side), sehingga tidak ada kredensial di browser.
+ * Upload gambar ke Supabase Storage (bucket `vshop-assets`, folder PER USER:
+ * `{auth.uid()}/{usaha|produk|uploads}-…` — selaras dengan policy RLS storage
+ * migration 0012 yang hanya mengizinkan tulis di folder milik sendiri).
+ * Wajib login; file divalidasi tipe & ukuran; akses storage lewat service-role
+ * key (server-side), sehingga tidak ada kredensial di browser.
  */
 export async function POST(req: Request) {
   await ensureHydrated();
@@ -58,7 +60,9 @@ export async function POST(req: Request) {
   const folder =
     typeof folderRaw === "string" && /^[a-z0-9-]+$/.test(folderRaw) ? folderRaw : "uploads";
   const ext = file.name.split(".").pop()?.toLowerCase() || "png";
-  const key = `${folder}/${user.id}-${Date.now()}-${Math.random()
+  // Folder PER USER: `{auth.uid()}/{folder}-…` — policy storage 0012 hanya
+  // mengizinkan tulis di folder milik sendiri (segment path pertama = uid).
+  const key = `${user.id}/${folder}-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2, 8)}.${ext}`;
 

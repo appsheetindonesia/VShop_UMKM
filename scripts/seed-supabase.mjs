@@ -201,14 +201,42 @@ const wallets = [
 ];
 
 // ---------- Order demo (paket 30 hari sudah dibayar) ----------
+// `metadata.paymentAudit` diisi KRONOLOGI status pembayaran lengkap (format
+// PaymentAuditEvent — lihat README) agar data contoh punya riwayat yang sama
+// dgn order asli; entri TERAKHIR = status saat ini (paid).
+const orderCreatedAt = daysFromNow(-5);
+const orderPaidAt = daysFromNow(-5);
 const orders = [
   {
     id: newId("ord"), order_number: "VS-20260811-0001", user_id: customer.id, type: "package",
     items: [{ name: "Paket 30 Hari", unitPrice: 25000, quantity: 1 }], total_amount: 25000,
     status: "paid", payment_status: "paid", payment_method: "QRIS", snap_token: "snap-demo-seeded",
     shipping_address: { nama: "Siti Aminah", phone: "081234567890", alamat: "Jl. Anggrek No. 7", kota: "Jakarta", kodePos: "12345" },
-    metadata: { packageId: "pkg_30hari", packageName: "Paket 30 Hari", days: 30 },
-    created_at: daysFromNow(-5), paid_at: daysFromNow(-5),
+    metadata: {
+      packageId: "pkg_30hari", packageName: "Paket 30 Hari", days: 30,
+      paymentAudit: [
+        {
+          at: orderCreatedAt, source: "create", event: "created",
+          paymentStatus: "pending", orderNumber: "VS-20260811-0001",
+        },
+        {
+          at: orderCreatedAt, source: "status-api", event: "pending",
+          paymentStatus: "pending", statusCode: "201",
+          statusMessage: "Success, transaction is found",
+          transactionStatus: "pending", transactionId: "txn-seed-0001",
+          paymentType: "qris", orderNumber: "VS-20260811-0001",
+        },
+        {
+          at: orderPaidAt, source: "webhook", event: "paid",
+          paymentStatus: "paid", statusCode: "200",
+          statusMessage: "Success, transaction is settled",
+          transactionStatus: "settlement", transactionId: "txn-seed-0001",
+          paymentType: "qris", orderNumber: "VS-20260811-0001",
+          detail: "Pembayaran via QRIS",
+        },
+      ],
+    },
+    created_at: orderCreatedAt, paid_at: orderPaidAt,
   },
 ];
 

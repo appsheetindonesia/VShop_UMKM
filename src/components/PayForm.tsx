@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { postJson, useSubmit } from "@/lib/client";
 
 declare global {
@@ -71,7 +71,11 @@ export default function PayForm({
   const [error, setError] = useState<string | null>(null);
   /** Alasan gagal dari Snap onError — ditampilkan di popup SEBELUM redirect. */
   const [snapError, setSnapError] = useState<{ reason: string; code?: string } | null>(null);
-  const embedCalled = useRef(false);
+  /** Token embed efektif: dari prop, atau token BARU setelah "Coba Lagi"
+   *  (retry API mengembalikan token baru → re-embed tanpa keluar halaman). */
+  const [token, setToken] = useState<string | undefined>(snapToken);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
   const isQris = method === "qris";
   const real = !mock;
 
@@ -111,12 +115,16 @@ export default function PayForm({
     });
   };
 
-  /** Tanya Midtrans Status API lalu redirect ke sukses/gagal; pending → state. */
+  /**
+   * RECONCILE penuh (?reconcile=1): baca store dulu (hasil webhook), baru
+   * fallback ke Midtrans Status API bila masih pending — lalu redirect ke
+   * sukses/gagal. Dipakai aksi user ("Cek Status") & callback Snap.
+   */
   const verifyAndRedirect = async (): Promise<void> => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/pay/${orderId}/status`)
+      const res = await fetch(`/api/pay/${orderId}/status?reconcile=1`)
         .then((r) => r.json())
         .catch(() => null);
       if (res?.ok && res.status === "paid") {
@@ -179,6 +187,42 @@ const handleSnapSuccess = (result?: unknown) => {
     setInfo("Pembayaran belum selesai. Selesaikan pembayaran di form di atas, atau cek status pembayaran.");
   };
 
+  /**
+   * "Coba Lagi" di popup onError: panggil API retry TANPA keluar halaman,
+   * lalu re-embed Snap dengan token baru (order dikembalikan ke pending di
+   * server). Bila API tidak mengembalikan token (mode demo/error), fallback
+   * ke redirect halaman bayar.
+   */
+  const retryNow = async () => {
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      const res = await postJson<{ ok: boolean; snapToken?: string; redirect?: string; message?: string }>(
+        `/api/pay/${orderId}/retry`,
+        {}
+      );
+      if (!res?.ok) {
+        setRetryError(res?.message ?? "Gagal menyiapkan ulang. Coba lagi.");
+        return;
+      }
+      // Tutup popup + segarkan state form; token baru memicu re-embed.
+      setSnapError(null);
+      setRetryError(null);
+      setEmbedFailed(false);
+      setPending(false);
+      setInfo(null);
+      if (typeof res.snapToken === "string" && res.snapToken.length > 0) {
+        setToken(res.snapToken);
+      } else {
+        window.location.href = res.redirect ?? `/bayar/${orderId}`;
+      }
+    } catch {
+      setRetryError("Terjadi kesalahan koneksi. Coba lagi.");
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   /** Catat callback Snap ke metadata order (audit trail) — fire-and-forget. */
   const recordCallback = (event: string, result?: unknown) => {
     const normalized =
@@ -193,9 +237,99 @@ const handleSnapSuccess = (result?: unknown) => {
     }).catch(() => null);
   };
 
-  // ---------- Snap EMBED: render form pembayaran inline saat halaman dimuat ----------
+  // ---------- Reconcile saat PAGE LOAD (webhook utama, Status API fallback) ----------
+  // Halaman dirender dari store (SSR), tapi webhook bisa tiba SETELAH render
+  // (tab dibiarkan terbuka, atau halaman dibuka ulang saat transaksi sudah
+  // selesai). Reconcile SEKALI: store dulu; bila masih pending, tanya
+  // Midtrans Status API sebagai fallback webhook telat → redirect bila
+  // terminal.
   useEffect(() => {
-    if (!real || !embed || !snapToken) return;
+    if (mock) return;
+    let cancelled = false;
+    (async () => {
+      const res = await fetch(`/api/pay/${orderId}/status?reconcile=1`)
+        .then((r) => r.json())
+        .catch(() => null);
+      if (cancelled || !res?.ok) return;
+      if (res.status === "paid" || res.status === "failed" || res.status === "expired") {
+        window.location.href = res.redirect;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId, mock]);
+
+  // ---------- Polling FALLBACK (webhook = sumber utama; Midtrans hanya eskalasi) ----------
+  // Selama order masih pending, pantau STORE lokal (hasil webhook) tiap 5s —
+  // murah & tanpa menyentuh Midtrans. Bila webhook tidak kunjung datang
+  // (tertunda / tak bisa menjangkau aplikasi, mis. dev lokal tanpa tunnel),
+  // eskalasi ke reconcile (Status API) untuk beberapa menit lagi, lalu
+  // berhenti dan serahkan ke tombol manual "Cek Status".
+  useEffect(() => {
+    if (!real || !embed) return;
+    let cancelled = false;
+    let stopped = false;
+    let localAttempts = 0;
+    let reconcileAttempts = 0;
+    const LOCAL_ATTEMPTS = 6; // ±30 detik pantau webhook (tanpa Midtrans)
+    const RECONCILE_ATTEMPTS = 18; // ±90 detik lagi fallback Status API
+    const INTERVAL_MS = 5000;
+
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      setPending(true);
+      setInfo(
+        "Pembayaran belum terkonfirmasi otomatis. Gunakan 'Cek Status' untuk menyinkronkan dengan Midtrans."
+      );
+    };
+
+    const tick = async () => {
+      if (cancelled || stopped) return;
+      const useReconcile = localAttempts >= LOCAL_ATTEMPTS;
+      if (useReconcile) {
+        reconcileAttempts++;
+        if (reconcileAttempts >= RECONCILE_ATTEMPTS) {
+          stop();
+          return;
+        }
+      } else {
+        localAttempts++;
+      }
+      try {
+        const res = await fetch(
+          `/api/pay/${orderId}/status${useReconcile ? "?reconcile=1" : ""}`
+        )
+          .then((r) => r.json())
+          .catch(() => null);
+        if (cancelled || stopped) return;
+        if (
+          res?.ok &&
+          (res.status === "paid" || res.status === "failed" || res.status === "expired")
+        ) {
+          window.location.href = res.redirect;
+        }
+      } catch {
+        // lanjut ke tick berikutnya
+      }
+    };
+
+    const timer = setInterval(() => void tick(), INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId, real, embed]);
+
+  // ---------- Snap EMBED: render form pembayaran inline saat halaman dimuat ----------
+  // Effect di-key oleh `token` (bukan snapToken prop): setelah "Coba Lagi"
+  // popup memakai token baru → effect berjalan ulang → embed ulang in-place.
+  useEffect(() => {
+    if (!real || !embed || !token) return;
     let cancelled = false;
     (async () => {
       const ready = await loadSnap();
@@ -205,11 +339,9 @@ const handleSnapSuccess = (result?: unknown) => {
         setInfo("Gagal memuat pembayaran inline. Gunakan tautan di bawah untuk membayar.");
         return;
       }
-      // Guard di titik panggil: StrictMode menjalankan effect dua kali —
-      // pastikan snap.embed hanya dipanggil sekali.
-      if (embedCalled.current) return;
-      embedCalled.current = true;
-      window.snap.embed(snapToken, {
+      // StrictMode menjalankan effect dua kali — run pertama dibatalkan lewat
+      // `cancelled` sebelum sempat memanggil snap.embed (cleanup sinkron).
+      window.snap.embed(token, {
         embedId: "snap-container",
         onSuccess: (result?: unknown) => void handleSnapSuccess(result),
         onPending: (result?: unknown) => {
@@ -225,7 +357,7 @@ const handleSnapSuccess = (result?: unknown) => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [real, embed, snapToken]);
+  }, [real, embed, token]);
 
   // ---------- Mode asli tanpa embed (tidak ada client key) → VT-web ----------
   const payViaRedirect = async () => {
@@ -386,23 +518,36 @@ const handleSnapSuccess = (result?: unknown) => {
               <p className="mt-1 font-mono text-xs text-gray-400">Kode {snapError.code}</p>
             )}
             <p className="mt-2 text-xs text-gray-500">
-              Pembayaran tidak dapat diproses. Buka detail untuk mencoba lagi atau kembali ke
-              beranda.
+              Pembayaran tidak dapat diproses. Coba lagi untuk menyiapkan pembayaran ulang, atau
+              buka detail untuk info lengkap.
             </p>
             <div className="mt-4 space-y-2">
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={() => void retryNow()}
+                className="btn-primary block w-full"
+              >
+                {retrying ? "Menyiapkan ulang..." : "Coba Lagi"}
+              </button>
               <a
                 href={`/bayar/gagal?order=${orderId}&reason=failed`}
-                className="btn-primary block w-full"
+                className="btn-secondary block w-full text-center"
               >
                 Lihat Detail
               </a>
               <button
                 type="button"
                 onClick={() => setSnapError(null)}
-                className="btn-secondary w-full"
+                className="w-full text-center text-xs font-semibold text-gray-500 hover:underline"
               >
                 Tutup
               </button>
+              {retryError && (
+                <div role="alert" className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {retryError}
+                </div>
+              )}
             </div>
           </div>
         </div>

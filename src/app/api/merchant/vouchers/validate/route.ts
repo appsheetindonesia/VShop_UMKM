@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { ensureHydrated } from "@/lib/db";
 import { getSessionUser } from "@/lib/auth";
 import { getMerchantByUserId, redeemVoucher } from "@/lib/service";
+import { notifyVoucherRedeemed } from "@/lib/whatsapp";
 import { redeemSchema } from "@/lib/validation";
 
 export async function POST(req: Request) {
@@ -37,6 +38,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, message: result.message ?? "Validasi gagal" }, { status: 400 });
   }
   const claim = result.claim;
+  // Konfirmasi redeem ke WhatsApp merchant (fire-and-forget, tidak menggagalkan validasi).
+  if (claim) {
+    void notifyVoucherRedeemed(merchant.noWAUsaha, merchant.namaUsaha, claim);
+  }
   return NextResponse.json({
     ok: true,
     claim: {

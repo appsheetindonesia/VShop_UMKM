@@ -23,7 +23,14 @@ export async function POST(_req: Request, { params }: { params: { orderId: strin
 
   try {
     const updated = await retryOrderPayment(order.id);
-    return NextResponse.json({ ok: true, redirect: `/bayar/${updated.id}` });
+    // snapToken ikut dikirim agar UI (popup onError Snap) bisa re-embed
+    // langsung tanpa keluar halaman; redirect tetap disediakan sebagai
+    // fallback navigasi.
+    return NextResponse.json({
+      ok: true,
+      redirect: `/bayar/${updated.id}`,
+      snapToken: updated.snapToken ?? null,
+    });
   } catch (err) {
     return NextResponse.json(
       { ok: false, message: err instanceof Error ? err.message : "Gagal menyiapkan ulang" },

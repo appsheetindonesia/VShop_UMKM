@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Badge, { statusColor } from "@/components/Badge";
+import Badge, { claimBadge } from "@/components/Badge";
 import { requireRole } from "@/lib/auth";
 import {
   getMerchantByUserId,
@@ -124,7 +124,7 @@ export default function LaporanPage() {
                   <td className="px-4 py-3 font-mono text-xs text-brand-700">{c.kode}</td>
                   <td className="px-4 py-3 font-mono text-xs text-accent-600">{c.kodeKonfirmasi}</td>
                   <td className="px-4 py-3">
-                    <Badge color={statusColor(c.status)}>{c.status}</Badge>
+                    <ClaimStatusBadge status={c.status} />
                   </td>
                 </tr>
               ))}
@@ -134,11 +134,16 @@ export default function LaporanPage() {
                     Belum ada voucher yang diklaim.
                   </td>
                 </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
+              )}          </tbody>
+        </table>
+      </div>
+    </section>
     </div>
   );
+}
+
+/** Badge status klaim — label Bahasa Indonesia, konsisten dgn tampilan klaim lain. */
+function ClaimStatusBadge({ status }: { status: string }) {
+  const badge = claimBadge(status);
+  return <Badge color={badge.color}>{badge.label}</Badge>;
 }

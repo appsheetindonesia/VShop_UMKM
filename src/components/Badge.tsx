@@ -69,3 +69,21 @@ export function paymentBadge(
       return { label: status, color: "gray" };
   }
 }
+
+/**
+ * Badge untuk status klaim voucher (merchant dashboard/laporan): label
+ * Bahasa Indonesia + warna, mengikuti pola paymentBadge agar konsisten di
+ * semua tampilan (aktif → hijau, terpakai → oranye, kadaluarsa → abu-abu).
+ */
+export function claimBadge(status: string): { label: string; color: BadgeColor } {
+  switch (status) {
+    case "active":
+      return { label: "Aktif", color: "green" };
+    case "used":
+      return { label: "Terpakai", color: "orange" };
+    case "expired":
+      return { label: "Kadaluarsa", color: "gray" };
+    default:
+      return { label: status, color: "gray" };
+  }
+}

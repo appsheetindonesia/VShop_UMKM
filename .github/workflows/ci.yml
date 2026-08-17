@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests + coverage gate (src/lib ≥ 80%)
+        # Gagal (exit ≠ 0) bila statements/lines/functions/branches < 80% —
+        # lihat thresholds di vitest.config.mts.
+        run: npm run test:coverage
+
+  persist-chain:
+    # Job TERPISAH untuk regresi write-through koalesen (scripts/persist-chain
+    # .test.ts — mock PostgREST HTTP sungguhan + db.ts asli, tanpa Docker).
+    # Jalan paralel dengan `test` agar regresi koalesensi/dirty-tracking
+    # terdeteksi lebih cepat sebelum merge, dengan laporan [ukur] yang terlihat
+    # di log job ini (batas atas request per N mutasi).
+    name: Regresi persistChain (koalesensi write-through)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: persist-chain regression tests
+        # 15 test: koalesensi per koleksi, snapshot terbaru menang, urutan
+        # antar batch, lintas-flush tumpang-tindih, flushNow (batas waktu),
+        # drain SIGTERM, dan pengukuran jumlah request (batas atas).
+        run: npm run test:persist-chain

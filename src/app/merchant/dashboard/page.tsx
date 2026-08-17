@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import Badge, { statusColor } from "@/components/Badge";
+import Badge, { claimBadge } from "@/components/Badge";
 import { requireRole } from "@/lib/auth";
 import { getMerchantByUserId, getMerchantClaims, getMerchantStats } from "@/lib/service";
 import { formatRupiah, merchantCode } from "@/lib/format";
@@ -84,7 +84,7 @@ export default function MerchantDashboardPage() {
                   <td className="px-3 py-2.5 text-gray-600">{c.user?.name ?? "-"}</td>
                   <td className="px-3 py-2.5 font-mono text-xs text-brand-700">{c.kode}</td>
                   <td className="px-3 py-2.5">
-                    <Badge color={statusColor(c.status)}>{c.status}</Badge>
+                    <ClaimStatusBadge status={c.status} />
                   </td>
                 </tr>
               ))}
@@ -101,6 +101,12 @@ export default function MerchantDashboardPage() {
       </section>
     </div>
   );
+}
+
+/** Badge status klaim — label Bahasa Indonesia, konsisten dgn tampilan klaim lain. */
+function ClaimStatusBadge({ status }: { status: string }) {
+  const badge = claimBadge(status);
+  return <Badge color={badge.color}>{badge.label}</Badge>;
 }
 
 function StatCard({ label, value, icon }: { label: string; value: string; icon: string }) {

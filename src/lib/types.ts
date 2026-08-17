@@ -93,10 +93,14 @@ export interface ClaimedVoucher {
   claimedAt: string;
   usedAt?: string;
   useCount: number;
+  /** Waktu notifikasi "voucher hampir kadaluarsa" (48 jam) terakhir dikirim (dedupe cron). */
+  expiringNotifiedAt?: string;
+  /** Waktu notifikasi H-1 (24 jam) terakhir dikirim (dedupe cron tier kedua). */
+  expiring24hNotifiedAt?: string;
 }
 
 export type OrderType = "package" | "topup" | "merchandise";
-export type PaymentStatus = "pending" | "paid" | "failed" | "expired";
+export type PaymentStatus = "pending" | "paid" | "failed" | "expired" | "cancelled";
 export type OrderStatus =
   | "pending"
   | "paid"
@@ -138,6 +142,7 @@ export type PaymentAuditSource =
   | "create" // order dibuat
   | "snap" // callback Snap.js dari halaman bayar
   | "status-api" // Status API Midtrans (pemantauan server)
+  | "poll" // polling LOKAL halaman bayar (pantau store — tanpa Midtrans)
   | "webhook" // notifikasi webhook Midtrans
   | "client-fail" // route fail dari layar pembayaran
   | "cron" // auto-expire order
@@ -167,6 +172,10 @@ export interface PaymentAuditEvent {
   transactionId?: string;
   /** payment_type Midtrans (qris, bank_transfer, …). */
   paymentType?: string;
+  /** channel_response_code Midtrans (kode spesifik GoPay/OVO/VA/bank). */
+  channelResponseCode?: string;
+  /** channel_response_message mentah dari Midtrans. */
+  channelResponseMessage?: string;
   /** Nomor order saat kejadian (berubah saat retry). */
   orderNumber?: string;
   /** Alasan / keterangan tambahan (mis. alasan gagal spesifik). */

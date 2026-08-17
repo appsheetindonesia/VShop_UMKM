@@ -38,3 +38,26 @@
     @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
   }
 }
+
+/* ====== Cetak / "Save as PDF" — hanya area #invoice-print yang tampil ====== */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #invoice-print,
+  #invoice-print * {
+    visibility: visible;
+  }
+  #invoice-print {
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+  #invoice-print .card {
+    border-color: #d1d5db;
+    box-shadow: none;
+  }
+}

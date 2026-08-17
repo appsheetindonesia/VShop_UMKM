@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import RetryPaymentButton from "@/components/RetryPaymentButton";
 import { getSessionUser } from "@/lib/auth";
-import { getOrder } from "@/lib/service";
+import { countOrderRetries, getOrder, MAX_ORDER_RETRIES } from "@/lib/service";
 
 export const metadata: Metadata = {
   title: "Pembayaran Gagal",
@@ -27,8 +27,9 @@ export default function GagalPage({
   const orderId = searchParams?.order;
   const reason = searchParams?.reason === "expired" ? "expired" : "failed";
 
-  // Alasan spesifik (jika order milik pengguna yang sedang login).
+  // Alasan spesifik + sisa percobaan retry (jika order milik pengguna yang login).
   let specificReason: string | null = null;
+  let retriesLeft: number | null = null;
   if (orderId) {
     const user = getSessionUser();
     const order = getOrder(orderId);
@@ -37,6 +38,7 @@ export default function GagalPage({
       if (typeof stored === "string" && stored.trim()) {
         specificReason = stored.trim();
       }
+      retriesLeft = Math.max(0, MAX_ORDER_RETRIES - countOrderRetries(order));
     }
   }
 
@@ -80,7 +82,17 @@ export default function GagalPage({
 
         <div className="space-y-3 p-6 pt-0">
           {orderId ? (
-            <RetryPaymentButton orderId={orderId} />
+            retriesLeft === null || retriesLeft > 0 ? (
+              <RetryPaymentButton orderId={orderId} />
+            ) : (
+              <div
+                role="alert"
+                className="rounded-xl bg-gray-100 px-4 py-3 text-center text-sm text-gray-600"
+              >
+                Batas percobaan pembayaran ulang tercapai (maks {MAX_ORDER_RETRIES}x).
+                Silakan hubungi admin atau gunakan metode pembayaran lain.
+              </div>
+            )
           ) : (
             <Link href="/beranda" className="btn-primary w-full">
               Coba Lagi

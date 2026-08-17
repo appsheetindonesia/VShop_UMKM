@@ -10,6 +10,10 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     { href: "/admin/merchants", label: "Merchant", icon: "🏪" },
     { href: "/admin/produk", label: "Produk", icon: "🛍️" },
     { href: "/admin/orders", label: "Pesanan", icon: "🧾" },
+    { href: "/admin/notifikasi", label: "Log Notifikasi", icon: "📣" },
+    { href: "/admin/kadaluarsa", label: "Order Kadaluarsa", icon: "⏰" },
+    { href: "/admin/cron", label: "Cron Jobs", icon: "⏱️" },
+    { href: "/admin/configurasi", label: "Configurasi", icon: "⚙️" },
   ];
 
   return (

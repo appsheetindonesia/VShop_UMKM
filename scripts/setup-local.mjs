@@ -4,7 +4,8 @@
  *
  *   node scripts/setup-local.mjs            # semua langkah
  *   node scripts/setup-local.mjs --reset    # + supabase db reset (migration + seed.sql dari nol)
- *   node scripts/setup-local.mjs --no-seed  # lewati seed data demo
+ *   node scripts/setup-local.mjs --no-seed  # lewati seed data demo (dan verifikasi keamanan)
+ *   node scripts/setup-local.mjs --no-rls   # lewati verifikasi keamanan e2e-rls
  *   node scripts/setup-local.mjs --skip-start  # stack sudah jalan; hanya baca kredensial + tulis .env.local
  *
  * Yang dilakukan secara otomatis:
@@ -17,6 +18,8 @@
  *      yang sudah Anda isi TIDAK diubah; SESSION_ENCRYPTION_KEY digenerate
  *      bila belum ada).
  *   5. Seed data demo (`scripts/seed-supabase.mjs`).
+ *   6. Verifikasi keamanan `scripts/e2e-rls.mjs` (RLS + Storage + Auth phone)
+ *      — otomatis setiap setup; lewati dengan `--no-rls`.
  *
  * Butuh Docker berjalan; tanpa Docker, keluar dengan pesan jelas.
  */
@@ -29,6 +32,7 @@ const args = process.argv.slice(2);
 const FLAGS = {
   reset: args.includes("--reset"),
   noSeed: args.includes("--no-seed"),
+  noRls: args.includes("--no-rls"),
   skipStart: args.includes("--skip-start"),
 };
 
@@ -36,6 +40,7 @@ const ROOT = process.cwd();
 const ENV_FILE = path.join(ROOT, ".env.local");
 const CONFIG_TOML = path.join(ROOT, "supabase", "config.toml");
 const SEED_SCRIPT = path.join(ROOT, "scripts", "seed-supabase.mjs");
+const RLS_SCRIPT = path.join(ROOT, "scripts", "e2e-rls.mjs");
 
 const SH = process.platform === "win32"; // npm/npx.cmd butuh shell di Windows
 const SEP = process.platform === "win32" ? ";" : ":";
@@ -83,7 +88,7 @@ const supabase = (supabaseArgs, opts = {}) => run("npx", ["--yes", "supabase", .
 
 // ==================== 1. Docker ====================
 async function checkDocker() {
-  console.log("1/5 Memeriksa Docker…");
+  console.log("1/6 Memeriksa Docker…");
   const { code, out } = await run("docker", ["version", "--format", "{{.Server.Version}}"], { capture: true });
   if (code === 0) {
     ok(`Docker engine siap (server v${out.trim()})`);
@@ -105,10 +110,10 @@ async function checkDocker() {
 // ==================== 2. supabase start ====================
 async function startStack() {
   if (FLAGS.skipStart) {
-    console.log("2/5 (--skip-start) Melewati `supabase start`…");
+    console.log("2/6 (--skip-start) Melewati `supabase start`…");
     return;
   }
-  console.log("2/5 Menjalankan `supabase start` (pertama kali mengunduh image — bisa beberapa menit)…");
+  console.log("2/6 Menjalankan `supabase start` (pertama kali mengunduh image — bisa beberapa menit)…");
   const { code } = await supabase(["start"]);
   if (code !== 0) {
     fail(
@@ -121,7 +126,7 @@ async function startStack() {
 
 // ==================== 3. Kredensial ====================
 async function readCredentials() {
-  console.log("3/5 Membaca kredensial dari `supabase status -o env`…");
+  console.log("3/6 Membaca kredensial dari `supabase status -o env`…");
   const { code, out } = await supabase(["status", "-o", "env"], { capture: true });
   if (code !== 0) {
     fail(`\`supabase status\` gagal:\n${out.slice(-500)}`);
@@ -149,7 +154,7 @@ function readEnvLines() {
 }
 
 function writeEnvLocal(creds) {
-  console.log("4/5 Menulis .env.local (merge — kunci lain dipertahankan)…");
+  console.log("4/6 Menulis .env.local (merge — kunci lain dipertahankan)…");
   const lines = readEnvLines();
   const updates = {
     NEXT_PUBLIC_SUPABASE_URL: creds.NEXT_PUBLIC_SUPABASE_URL,
@@ -188,10 +193,10 @@ function writeEnvLocal(creds) {
 // ==================== 5. Seed ====================
 async function seed(creds) {
   if (FLAGS.noSeed) {
-    console.log("5/5 (--no-seed) Melewati seed data demo.");
+    console.log("5/6 (--no-seed) Melewati seed data demo.");
     return;
   }
-  console.log("5/5 Menjalankan seed data demo…");
+  console.log("5/6 Menjalankan seed data demo…");
   const { code } = await run("node", [SEED_SCRIPT], {
     env: {
       NEXT_PUBLIC_SUPABASE_URL: creds.NEXT_PUBLIC_SUPABASE_URL,
@@ -200,6 +205,33 @@ async function seed(creds) {
   });
   if (code !== 0) fail("Seed data demo gagal — lihat log di atas.");
   ok("Seed data demo selesai");
+}
+
+// ==================== 6. Verifikasi keamanan (e2e-rls) ====================
+async function runRls(creds) {
+  if (FLAGS.noRls) {
+    console.log("6/6 (--no-rls) Melewati verifikasi keamanan.");
+    return;
+  }
+  if (FLAGS.noSeed) {
+    console.log("6/6 (--no-seed) Melewati verifikasi keamanan (butuh user demo dari seed).");
+    return;
+  }
+  console.log("6/6 Verifikasi keamanan (RLS + Storage + Auth phone — scripts/e2e-rls.mjs)…");
+  const { code } = await run("node", [RLS_SCRIPT], {
+    env: {
+      NEXT_PUBLIC_SUPABASE_URL: creds.NEXT_PUBLIC_SUPABASE_URL,
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: creds.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+      SUPABASE_SERVICE_ROLE_KEY: creds.SUPABASE_SERVICE_ROLE_KEY,
+    },
+  });
+  if (code !== 0) {
+    fail(
+      "Verifikasi keamanan GAGAL — perbaiki policy/ekspektasi lalu jalankan ulang\n" +
+        "  `node scripts/e2e-rls.mjs` (atau lewati sementara dengan `--no-rls`)."
+    );
+  }
+  ok("Verifikasi keamanan lolos (RLS + Storage + Auth phone)");
 }
 
 // ==================== Main ====================
@@ -230,6 +262,7 @@ const { creds } = await readCredentials();
 writeEnvLocal(creds);
 await seed(creds);
 hintConfigToml();
+await runRls(creds);
 
 console.log(`
 === Setup selesai ✅ ===
@@ -238,9 +271,11 @@ console.log(`
   Postgres  : postgresql://postgres:postgres@127.0.0.1:54322/postgres
   anon key  : ${creds.NEXT_PUBLIC_SUPABASE_ANON_KEY.slice(0, 20)}… (tersimpan di .env.local)
   service   : ${creds.SUPABASE_SERVICE_ROLE_KEY.slice(0, 20)}… (tersimpan di .env.local)
+  keamanan  : RLS + Storage + Auth phone terverifikasi (scripts/e2e-rls.mjs)
 
 Langkah berikutnya:
   npm run dev          # jalankan aplikasi — log [db] menandakan mode Supabase aktif
   # Akun demo: admin@vshop.id/admin123 · customer@vshop.id/customer123 · merchant@vshop.id/merchant123
   # OTP test (config.toml): 081234567890 → 123456 · 081298765432 → 654321
+  # Verifikasi ulang keamanan kapan saja: npm run db:rls
 `);

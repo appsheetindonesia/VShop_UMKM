@@ -158,7 +158,7 @@ create table if not exists public.orders (
   items jsonb not null default '[]'::jsonb,
   total_amount integer not null,
   status text not null default 'pending' check (status in ('pending', 'paid', 'processing', 'completed', 'cancelled')),
-  payment_status text not null default 'pending' check (payment_status in ('pending', 'paid', 'failed', 'expired')),
+  payment_status text not null default 'pending' check (payment_status in ('pending', 'paid', 'failed', 'expired', 'cancelled')),
   payment_method text,
   snap_token text,
   shipping_address jsonb,
@@ -299,6 +299,10 @@ create policy "claimed_vouchers_insert_authenticated" on public.claimed_vouchers
 drop policy if exists "orders_select_own" on public.orders;
 create policy "orders_select_own" on public.orders
   for select using (user_id = auth.uid()::text);
+
+drop policy if exists "orders_insert_own" on public.orders;
+create policy "orders_insert_own" on public.orders
+  for insert to authenticated with check (user_id = auth.uid()::text);
 
 -- Merchandise: publik lihat.
 drop policy if exists "merchandise_select_public" on public.merchandise;

@@ -1,5 +1,5 @@
 import { getDB, hashPassword, isoNow, mutate, newId } from "./db";
-import { createPaymentTransaction, ORDER_EXPIRY_HOURS } from "./midtrans";
+import { createPaymentTransaction, getOrderExpiryHours } from "./midtrans";
 import type {
   CartItem,
   ClaimedVoucher,
@@ -280,8 +280,40 @@ function nextOrderNumber(db: ReturnType<typeof getDB>): string {
   const ymd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(
     today.getDate()
   ).padStart(2, "0")}`;
-  const count = db.orders.filter((o) => o.orderNumber.includes(`VS-${ymd}`)).length + 1;
-  return `VS-${ymd}-${String(count).padStart(4, "0")}`;
+  // Pakai SUFFIX MAKSIMAL + 1 (bukan jumlah+1) agar aman terhadap nomor yang
+  // dihapus / gap: mis. hanya tersisa VS-…-0002 → berikutnya 0003, BUKAN 0002
+  // (duplikat). Deret diasumsikan berurutan di versi lama — bisa collision
+  // saat order uji dihapus.
+  let max = 0;
+  const re = new RegExp(`^VS-${ymd}-(\\d{4})$`);
+  for (const o of db.orders) {
+    const m = o.orderNumber.match(re);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `VS-${ymd}-${String(max + 1).padStart(4, "0")}`;
+}
+
+/**
+ * Nomor invoice STABIL `VS-INV-YYYYMMDD-XXXX` — dibuat SEKALI saat order
+ * dibuat dan TIDAK pernah berubah (beda dari `orderNumber` yang diganti
+ * saat retry). Sama seperti `nextOrderNumber`: suffix MAKSIMAL + 1 agar
+ * tahan gap/deletion; scan `metadata.invoiceNumber` (jsonb) karena bukan
+ * kolom tersendiri.
+ */
+function nextInvoiceNumber(db: ReturnType<typeof getDB>): string {
+  const today = new Date();
+  const ymd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(
+    today.getDate()
+  ).padStart(2, "0")}`;
+  let max = 0;
+  const re = new RegExp(`^VS-INV-${ymd}-(\\d{4})$`);
+  for (const o of db.orders) {
+    const inv =
+      typeof o.metadata?.invoiceNumber === "string" ? o.metadata.invoiceNumber : "";
+    const m = inv.match(re);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `VS-INV-${ymd}-${String(max + 1).padStart(4, "0")}`;
 }
 
 /**
@@ -304,8 +336,37 @@ function nextRetryOrderNumber(
 export async function createOrder(
   input: CreateOrderInput
 ): Promise<{ order: Order; mock: boolean }> {
-  const order = mutate((db) => {
-    const orderNumber = nextOrderNumber(db);
+  const user = getDB().users.find((u) => u.id === input.userId);
+
+  // id & nomor order dihitung SEBELUM transaksi Midtrans (transaksi butuh
+  // keduanya). Order + snapToken lalu ditulis dalam SATU mutate di bawah —
+  // checkout hanya 1 tulis ke tabel orders (sebelumnya 2: order tanpa token,
+  // lalu token di mutate kedua). Konsekuensinya: kalau Midtrans gagal, order
+  // tidak pernah dibuat (all-or-nothing) — pemanggil (route checkout)
+  // menangkap error dan pelanggan mengulang checkout.
+  const orderId = newId("ord");
+  const provisionalNumber = nextOrderNumber(getDB());
+  const payment = await createPaymentTransaction({
+    orderId,
+    orderNumber: provisionalNumber,
+    totalAmount: input.totalAmount,
+    customerName: user?.name,
+    customerEmail: user?.email,
+    customerPhone: user?.phone,
+  });
+
+  const created = mutate((db) => {
+    // Nomor FINAL divalidasi ATOMIK di dalam mutate: bila order lain keburu
+    // memakai provisionalNumber selama await Midtrans (konkurensi langka),
+    // geser ke nomor bebas — keunikan dijamin scan di sini (pola sama dengan
+    // retry). Transaksi Midtrans pertama memakai provisionalNumber; pada
+    // tabrakan transaksi dibuat ulang dengan nomor final (lihat bawah) agar
+    // order_id Midtrans tetap sama dengan orderNumber (kontrak webhook).
+    const taken = db.orders.some((o) => o.orderNumber === provisionalNumber);
+    const orderNumber = taken
+      ? nextRetryOrderNumber(db, provisionalNumber)
+      : provisionalNumber;
+
     // Log audit dibuka sejak order dibuat — kronologi lengkap dari awal.
     const audit: PaymentAuditEvent[] = [
       {
@@ -314,10 +375,17 @@ export async function createOrder(
         event: "created",
         paymentStatus: "pending",
         orderNumber,
+        ...(taken
+          ? { detail: `Nomor sementara ${provisionalNumber} bertabrakan — dipakai ${orderNumber}` }
+          : {}),
       },
     ];
+    // Nomor invoice dibuat SEKALI di sini dan tidak pernah berubah — bahkan
+    // saat retry mengganti orderNumber — jadi bukti transaksi selalu punya
+    // referensi yang stabil (VS-INV-YYYYMMDD-XXXX).
+    const invoiceNumber = nextInvoiceNumber(db);
     const order: Order = {
-      id: newId("ord"),
+      id: orderId,
       orderNumber,
       userId: input.userId,
       type: input.type,
@@ -326,34 +394,59 @@ export async function createOrder(
       status: "pending",
       paymentStatus: "pending",
       shippingAddress: input.address,
-      metadata: { ...input.metadata, paymentAudit: audit },
+      snapToken: payment.token,
+      metadata: {
+        ...input.metadata,
+        invoiceNumber,
+        paymentAudit: audit,
+        ...(payment.redirectUrl ? { snapRedirectUrl: payment.redirectUrl } : {}),
+      },
       createdAt: isoNow(),
     };
     db.orders.push(order);
-    return order;
+    return { order, needsRebuild: taken };
   });
 
-  const user = getDB().users.find((u) => u.id === input.userId);
-  const payment = await createPaymentTransaction({
-    orderId: order.id,
-    orderNumber: order.orderNumber,
-    totalAmount: order.totalAmount,
-    customerName: user?.name,
-    customerEmail: user?.email,
-    customerPhone: user?.phone,
-  });
+  if (created.needsRebuild) {
+    // JALUR JARANG (konkurensi): transaksi pertama memakai nomor yang
+    // ternyata diambil order lain — buat ulang dengan nomor FINAL. Kasus ini
+    // menulis 2× (order + token); jalur normal tetap 1 tulis.
+    const payment2 = await createPaymentTransaction({
+      orderId,
+      orderNumber: created.order.orderNumber,
+      totalAmount: created.order.totalAmount,
+      customerName: user?.name,
+      customerEmail: user?.email,
+      customerPhone: user?.phone,
+    });
+    const rebuilt = mutate((db) => {
+      const o = db.orders.find((x) => x.id === orderId);
+      if (!o) return null;
+      o.snapToken = payment2.token;
+      const meta = o.metadata as Record<string, unknown>;
+      if (payment2.redirectUrl) meta.snapRedirectUrl = payment2.redirectUrl;
+      else delete meta.snapRedirectUrl;
+      const audit = Array.isArray(meta.paymentAudit)
+        ? (meta.paymentAudit as PaymentAuditEvent[])
+        : [];
+      meta.paymentAudit = [
+        ...audit.slice(-(MAX_PAYMENT_AUDIT - 1)),
+        {
+          at: isoNow(),
+          source: "create",
+          event: "created",
+          paymentStatus: "pending",
+          orderNumber: o.orderNumber,
+          detail: "Transaksi Midtrans dibuat ulang dengan nomor final (tabrakan nomor)",
+        },
+      ];
+      o.metadata = meta;
+      return o;
+    });
+    return { order: rebuilt ?? created.order, mock: payment2.mock };
+  }
 
-  mutate((db) => {
-    const o = db.orders.find((x) => x.id === order.id);
-    if (o) {
-      o.snapToken = payment.token;
-      if (payment.redirectUrl) {
-        o.metadata = { ...o.metadata, snapRedirectUrl: payment.redirectUrl };
-      }
-    }
-  });
-
-  return { order: { ...order, snapToken: payment.token }, mock: payment.mock };
+  return { order: created.order, mock: payment.mock };
 }
 
 export function getOrder(orderId: string): Order | undefined {
@@ -392,6 +485,10 @@ export interface PaymentAuditInput {
   transactionId?: string;
   /** payment_type Midtrans (qris, bank_transfer, …). */
   paymentType?: string;
+  /** channel_response_code Midtrans (kode spesifik GoPay/OVO/VA/bank). */
+  channelResponseCode?: string;
+  /** channel_response_message mentah dari Midtrans. */
+  channelResponseMessage?: string;
   /** Nomor order saat kejadian (penting saat retry mengganti nomor). */
   orderNumber?: string;
   /** Alasan / keterangan tambahan. */
@@ -399,6 +496,22 @@ export interface PaymentAuditInput {
 }
 
 const MAX_PAYMENT_AUDIT = 50;
+
+/**
+ * Batas percobaan "Coba Lagi" per order (guard di sisi service). Order yang
+ * gagal terus-menerus tidak boleh di-retry tanpa batas — tiap retry membuat
+ * transaksi Midtrans baru & nomor order baru (riwayat mengembang). Bisa
+ * disetel via env MAX_ORDER_RETRIES (default 3).
+ */
+export const MAX_ORDER_RETRIES = Number(process.env.MAX_ORDER_RETRIES ?? 3);
+
+/** Hitung berapa kali order sudah di-retry (dari log audit paymentAudit). */
+export function countOrderRetries(order: Pick<Order, "metadata">): number {
+  const audit = Array.isArray(order.metadata?.paymentAudit)
+    ? (order.metadata.paymentAudit as PaymentAuditEvent[])
+    : [];
+  return audit.filter((e) => e.event === "retry").length;
+}
 
 /**
  * Tambahkan satu entri ke log audit pembayaran order
@@ -608,11 +721,19 @@ export function recordSnapCallback(
  * saja di-expire (pemanggil bisa memicu notifikasi lanjutan).
  */
 export function expireStaleOrders(now: Date = new Date()): string[] {
-  const cutoff = now.getTime() - ORDER_EXPIRY_HOURS * 3_600_000;
+  const cutoff = now.getTime() - getOrderExpiryHours() * 3_600_000;
   const stale = getDB().orders.filter(
     (o) =>
       o.paymentStatus === "pending" &&
-      new Date(o.createdAt).getTime() < cutoff
+      // Anchor kadaluarsa = retry terakhir (bila ada) ATAU createdAt. Tanpa
+      // ini, order yang di-retry (kembali pending, createdAt LAMA) akan
+      // di-expire ulang pada run berikutnya — padahal jendela pembayaran
+      // baru dimulai sejak retry.
+      new Date(
+        typeof o.metadata?.lastRetryAt === "string"
+          ? o.metadata.lastRetryAt
+          : o.createdAt
+      ).getTime() < cutoff
   );
   const expiredIds: string[] = [];
   for (const o of stale) {
@@ -621,6 +742,9 @@ export function expireStaleOrders(now: Date = new Date()): string[] {
     markOrderFailed(o.id, "expired", undefined, { source: "cron" });
     expiredIds.push(o.id);
   }
+  // Pencatatan run job (cron_runs) dipindah ke runExpiryJob (src/lib/cron.ts)
+  // agar SATU baris per eksekusi lengkap (order + pengingat voucher), bukan
+  // per sub-fungsi. Service ini tetap murni: hanya menandai & mengembalikan id.
   return expiredIds;
 }
 
@@ -638,6 +762,23 @@ export function expireStaleOrders(now: Date = new Date()): string[] {
 export async function retryOrderPayment(orderId: string): Promise<Order> {
   const order = getOrder(orderId);
   if (!order) throw new Error("Order tidak ditemukan");
+  // Pertahanan di sisi API (bukan hanya UI): order yang sudah LUNAS tidak
+  // boleh di-retry — membuat transaksi baru untuk order yang sudah dibayar
+  // berisiko charge ganda. UI hanya menampilkan "Coba Lagi" untuk
+  // gagal/kadaluarsa, tapi endpoint retry harus menolak sendiri bila order
+  // ternyata sudah berubah jadi paid (mis. dibayar di tab lain) atau dipanggil
+  // langsung. Caller mengembalikan 400 (rute /api/pay/[orderId]/retry).
+  if (order.paymentStatus === "paid") {
+    throw new Error("Order sudah lunas — tidak bisa di-retry");
+  }
+  // Batas percobaan: order yang gagal terus-menerus tidak boleh di-retry
+  // tanpa batas. Dihitung dari log audit (event "retry" di paymentAudit),
+  // jadi konsisten dengan metrik retry admin & riwayat nomor order.
+  if (countOrderRetries(order) >= MAX_ORDER_RETRIES) {
+    throw new Error(
+      `Batas percobaan pembayaran ulang tercapai (maks ${MAX_ORDER_RETRIES}x) — hubungi admin`
+    );
+  }
 
   // Nomor baru dihitung dari state saat ini — transaksi Midtrans memakai
   // nomor segar sehingga tidak bentrok dengan order_id terminal sebelumnya
@@ -705,6 +846,10 @@ export async function retryOrderPayment(orderId: string): Promise<Order> {
             : `Nomor order: ${oldNumber} → ${newOrderNumber}`,
       },
     ];
+    // Restart jendela kadaluarsa: anchor auto-expire = retry terakhir
+    // (expireStaleOrders memakai lastRetryAt ?? createdAt). Tanpa ini order
+    // yang di-retry di-expire ulang oleh cron pada run berikutnya.
+    meta.lastRetryAt = isoNow();
     o.metadata = meta;
     return o;
   });
@@ -848,6 +993,168 @@ export function getMyClaims(userId: string): (ClaimedVoucher & { voucher?: Vouch
     .filter((c) => c.userId === userId)
     .sort((a, b) => new Date(b.claimedAt).getTime() - new Date(a.claimedAt).getTime())
     .map((c) => ({ ...c, voucher: db.vouchers.find((v) => v.id === c.voucherId) }));
+}
+
+/** Jenis tier notifikasi voucher hampir kadaluarsa (dedupe terpisah). */
+export type ExpiringNotifyTier = "expiring" | "expiring_24h";
+
+/**
+ * Klaim voucher AKTIF yang masa berlakunya segera habis (dalam
+ * `windowHours` ke depan) dan BELUM pernah dinotifikasi untuk tier
+ * `notifiedField` yang diberikan. Basis kadaluarsa = `masaBerlaku` voucher
+ * terkait. Dipakai job terjadwal (cron) → notifikasi WhatsApp ke pelanggan.
+ */
+function claimsExpiringInWindow(
+  windowHours: number,
+  notifiedField: "expiringNotifiedAt" | "expiring24hNotifiedAt",
+  now: Date
+): (ClaimedVoucher & { voucher?: Voucher; user?: User })[] {
+  const db = getDB();
+  const nowMs = now.getTime();
+  const limitMs = nowMs + windowHours * 3_600_000;
+  return db.claimedVouchers
+    .filter((c) => {
+      if (c.status !== "active") return false;
+      if (c[notifiedField]) return false;
+      const v = db.vouchers.find((x) => x.id === c.voucherId);
+      if (!v) return false;
+      const exp = new Date(v.masaBerlaku).getTime();
+      return exp > nowMs && exp <= limitMs;
+    })
+    .map((c) => ({
+      ...c,
+      voucher: db.vouchers.find((x) => x.id === c.voucherId),
+      user: db.users.find((u) => u.id === c.userId),
+    }));
+}
+
+/**
+ * Tier 48 jam: klaim yang masa berlakunya habis dalam `windowHours` ke
+ * depan dan BELUM dinotifikasi (dedupe `expiringNotifiedAt`).
+ */
+export function getClaimsExpiringSoon(
+  windowHours: number,
+  now: Date = new Date()
+): (ClaimedVoucher & { voucher?: Voucher; user?: User })[] {
+  return claimsExpiringInWindow(windowHours, "expiringNotifiedAt", now);
+}
+
+/**
+ * Tier H-1 (24 jam): klaim yang masa berlakunya habis dalam `windowHours`
+ * ke depan dan BELUM dinotifikasi tier 24 jam (dedupe
+ * `expiring24hNotifiedAt`, independen dari tier 48 jam).
+ */
+export function getClaimsExpiringSoon24h(
+  windowHours: number = 24,
+  now: Date = new Date()
+): (ClaimedVoucher & { voucher?: Voucher; user?: User })[] {
+  return claimsExpiringInWindow(windowHours, "expiring24hNotifiedAt", now);
+}
+
+/** Tandai klaim sudah dinotifikasi "hampir kadaluarsa" 48 jam (dedupe cron). */
+export function markClaimExpiringNotified(claimId: string, at: Date = new Date()): void {
+  mutate((db) => {
+    const c = db.claimedVouchers.find((x) => x.id === claimId);
+    if (c) c.expiringNotifiedAt = at.toISOString();
+  });
+}
+
+export interface TierDeliveryMetric {
+  /** Label tier pengingat: "48-jam" (expiringNotifiedAt) / "H-1" (expiring24hNotifiedAt). */
+  tier: "48-jam" | "H-1";
+  /** Pelanggan (distinct userId) yang DINOTIFIKASI tier ini dalam periode. */
+  reminded: number;
+  /** Dari yang diingatkan, berapa yang lalu MEMBUAT KLAIM BARU setelah pengingat pertama. */
+  reclaimed: number;
+}
+
+/**
+ * Metrik pengiriman pengingat voucher per TIER (48 jam vs H-1) untuk
+ * halaman admin Log Notifikasi: berapa pelanggan diingatkan tiap tier, dan
+ * berapa dari mereka yang lalu "mengklaim ulang" — membuat klaim voucher
+ * BARU setelah pengingat pertama mereka (tanda notifikasi mendorong
+ * kunjungan ulang).
+ *
+ * Sumber: marker dedupe di klaim (`expiringNotifiedAt` /
+ * `expiring24hNotifiedAt`) — hanya diisi bila notifikasi benar-benar
+ * terkirim/dicatat (pemanggil cron menandai setelah sukses), jadi akurat
+ * per tier tanpa query notification_logs. Murni & sinkron; `now` bisa
+ * di-override untuk pengujian batas periode.
+ */
+export function getTierDeliveryMetrics(
+  now: Date = new Date(),
+  periodDays: number = 30
+): TierDeliveryMetric[] {
+  const db = getDB();
+  const periodStartMs = now.getTime() - periodDays * 86_400_000;
+  const tiers: Array<{
+    tier: TierDeliveryMetric["tier"];
+    field: "expiringNotifiedAt" | "expiring24hNotifiedAt";
+  }> = [
+    { tier: "48-jam", field: "expiringNotifiedAt" },
+    { tier: "H-1", field: "expiring24hNotifiedAt" },
+  ];
+
+  return tiers.map(({ tier, field }) => {
+    // Klaim yang dinotifikasi tier ini dalam periode (marker terisi).
+    const notified = db.claimedVouchers.filter((c) => {
+      const at = c[field];
+      return at !== undefined && new Date(at).getTime() >= periodStartMs;
+    });
+    const remindedUsers = new Set(notified.map((c) => c.userId));
+
+    // "Mengklaim ulang": user diingatkan yang punya klaim BARU (claimedAt)
+    // SETELAH pengingat pertama mereka untuk tier ini.
+    let reclaimed = 0;
+    for (const userId of Array.from(remindedUsers)) {
+      const firstReminderMs = Math.min(
+        ...notified
+          .filter((c) => c.userId === userId)
+          .map((c) => new Date(c[field] as string).getTime())
+      );
+      const hasNewClaim = db.claimedVouchers.some(
+        (c) =>
+          c.userId === userId &&
+          new Date(c.claimedAt).getTime() > firstReminderMs
+      );
+      if (hasNewClaim) reclaimed++;
+    }
+
+    return { tier, reminded: remindedUsers.size, reclaimed };
+  });
+}
+
+/** Tandai klaim sudah dinotifikasi H-1 / 24 jam (dedupe cron tier kedua). */
+export function markClaimExpiring24hNotified(claimId: string, at: Date = new Date()): void {
+  mutate((db) => {
+    const c = db.claimedVouchers.find((x) => x.id === claimId);
+    if (c) c.expiring24hNotifiedAt = at.toISOString();
+  });
+}
+
+/**
+ * Tandai klaim yang masa berlakunya sudah LEWAT sebagai 'expired' secara
+ * otomatis (dipanggil job terjadwal runExpiryJob). Konsistensi: voucher-saya
+ * menampilkan "Hangus", getken menolak redeem ("Voucher sudah kedaluwarsa"),
+ * dan klaim tidak lagi muncul di window notifikasi "hampir kadaluarsa".
+ * Idempoten: klaim non-aktif, tanpa voucher, atau belum lewat masa berlaku
+ * tidak disentuh. Mengembalikan jumlah klaim yang baru ditandai expired.
+ */
+export function expireStaleClaims(now: Date = new Date()): number {
+  const nowMs = now.getTime();
+  return mutate((db) => {
+    let count = 0;
+    for (const c of db.claimedVouchers) {
+      if (c.status !== "active") continue;
+      const v = db.vouchers.find((x) => x.id === c.voucherId);
+      if (!v) continue;
+      if (new Date(v.masaBerlaku).getTime() <= nowMs) {
+        c.status = "expired";
+        count++;
+      }
+    }
+    return count;
+  });
 }
 
 export function getMerchantByUserId(userId: string): Merchant | undefined {
@@ -1066,6 +1373,256 @@ export function getAdminStats() {
   };
 }
 
+/**
+ * Ringkasan riwayat pembayaran untuk dashboard admin: jumlah order per
+ * status PEMBAYARAN yang dibuat hari ini (zona server) + N order terbaru
+ * dengan nama pelanggan (join users). Dipakai seksi "Riwayat Pembayaran"
+ * di /admin (kartu ringkasan + tabel aksi retry dari sisi admin).
+ */
+export interface RetryMetricsDay {
+  /** Tanggal (zona server, YYYY-MM-DD). */
+  date: string;
+  attempts: number;
+  success: number;
+  failed: number;
+  /** Retry yang masih berstatus pending (belum ada hasil terminal). */
+  pending: number;
+}
+
+/** Ringkasan retry pembayaran untuk dashboard admin. */
+export interface RetryMetrics {
+  daily: RetryMetricsDay[];
+  /** Jumlah percobaan Coba Lagi pada hari ini (zona server). */
+  todayAttempts: number;
+  totalAttempts: number;
+  success: number;
+  failed: number;
+  pending: number;
+  /** success / (success+failed) ×100 (1 desimal); 0 bila belum ada hasil tuntas. */
+  successRate: number;
+}
+
+/** Kunci tanggal lokal (YYYY-MM-DD) untuk bucket per hari. */
+function localDateKey(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Event audit yang menandai HASIL TERMINAL dari sebuah retry. */
+const RETRY_TERMINAL_EVENTS = new Set(["paid", "failed", "expired", "cancelled"]);
+
+/**
+ * Metrik RETRY MASSAL untuk dashboard admin: jumlah percobaan "Coba Lagi"
+ * per hari + tingkat keberhasilan, dihitung dari log audit
+ * (`metadata.paymentAudit`, entri `event: "retry"`).
+ *
+ * Hasil tiap retry: status terminal PERTAMA setelah retry pada audit order
+ * (paid → sukses; failed/expired/cancelled → gagal); bila belum ada event
+ * terminal berikutnya, dipakai status pembayaran order saat ini (pending =
+ * masih berjalan, TIDAK dihitung dalam penyebut tingkat sukses). Retry yang
+ * terjadi di luar jendela `days` diabaikan.
+ */
+export function getRetryMetrics(days: number = 7): RetryMetrics {
+  const db = getDB();
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const todayKey = localDateKey(new Date(startOfToday));
+
+  const daily = new Map<string, RetryMetricsDay>();
+  for (let i = days - 1; i >= 0; i--) {
+    const key = localDateKey(new Date(startOfToday - i * 86_400_000));
+    daily.set(key, { date: key, attempts: 0, success: 0, failed: 0, pending: 0 });
+  }
+
+  let todayAttempts = 0;
+  let totalAttempts = 0;
+  let success = 0;
+  let failed = 0;
+  let pending = 0;
+
+  for (const o of db.orders) {
+    const audit = Array.isArray(o.metadata.paymentAudit)
+      ? (o.metadata.paymentAudit as PaymentAuditEvent[])
+      : [];
+    for (let i = 0; i < audit.length; i++) {
+      const ev = audit[i];
+      if (ev.event !== "retry") continue;
+
+      const day = daily.get(localDateKey(new Date(ev.at)));
+      if (!day) continue; // di luar jendela metrik
+
+      // Hasil retry: status terminal pertama setelahnya di audit; fallback
+      // ke status order saat ini (retry terakhir yang belum tuntas).
+      let outcome: string = o.paymentStatus;
+      for (let j = i + 1; j < audit.length; j++) {
+        if (RETRY_TERMINAL_EVENTS.has(audit[j].event)) {
+          outcome = audit[j].paymentStatus;
+          break;
+        }
+      }
+
+      day.attempts++;
+      totalAttempts++;
+      if (localDateKey(new Date(ev.at)) === todayKey) todayAttempts++;
+      if (outcome === "paid") {
+        day.success++;
+        success++;
+      } else if (outcome === "pending") {
+        day.pending++;
+        pending++;
+      } else {
+        day.failed++;
+        failed++;
+      }
+    }
+  }
+
+  const completed = success + failed;
+  return {
+    daily: Array.from(daily.values()),
+    todayAttempts,
+    totalAttempts,
+    success,
+    failed,
+    pending,
+    successRate: completed > 0 ? Math.round((success / completed) * 1000) / 10 : 0,
+  };
+}
+
+/**
+ * Satu baris order untuk tampilan admin (dashboard Riwayat Pembayaran &
+ * ekspor CSV): nomor order + nama pelanggan + jenis + nominal + status.
+ * `metadata` dibawa apa adanya (bukan untuk tampilan) agar
+ * `filterPaymentOrders` bisa mencocokkan nomor retry lama saat ekspor CSV
+ * terfilter — sama seperti halaman pelanggan. `items` / `paymentAudit` /
+ * `snapCallbacks` (rincian untuk panel detail saat baris diklik) dibawa
+ * dari order penuh sehingga dashboard tidak perlu request tambahan.
+ */
+export interface AdminPaymentRow {
+  id: string;
+  orderNumber: string;
+  customerId: string;
+  customerName: string;
+  type: Order["type"];
+  totalAmount: number;
+  paymentStatus: string;
+  status: string;
+  createdAt: string;
+  failureReason?: string;
+  metadata?: Record<string, unknown>;
+  /** Item order (panel detail). */
+  items?: OrderItem[];
+  /** Kronologi status pembayaran dari metadata.paymentAudit (panel detail). */
+  paymentAudit?: PaymentAuditEvent[];
+  /** Riwayat callback Snap.js dari metadata.snapCallbacks (panel detail). */
+  snapCallbacks?: SnapCallbackRecord[];
+}
+
+/** Map satu order ke `AdminPaymentRow` (nama pelanggan dari `db.users`). */
+function mapPaymentRow(o: Order, users: User[]): AdminPaymentRow {
+  const user = users.find((u) => u.id === o.userId);
+  return {
+    id: o.id,
+    orderNumber: o.orderNumber,
+    customerId: o.userId,
+    customerName: user?.name ?? "—",
+    type: o.type,
+    totalAmount: o.totalAmount,
+    paymentStatus: o.paymentStatus,
+    status: o.status,
+    createdAt: o.createdAt,
+    failureReason:
+      typeof o.metadata?.failureReason === "string" ? o.metadata.failureReason : undefined,
+    metadata: o.metadata,
+    items: o.items,
+    paymentAudit: Array.isArray(o.metadata?.paymentAudit)
+      ? (o.metadata.paymentAudit as PaymentAuditEvent[])
+      : [],
+    snapCallbacks: Array.isArray(o.metadata?.snapCallbacks)
+      ? (o.metadata.snapCallbacks as SnapCallbackRecord[])
+      : [],
+  };
+}
+
+/**
+ * Rentang waktu ringkasan pembayaran ADMIN (dashboard Riwayat Pembayaran &
+ * ekspor CSV): "today" (sejak awal hari, zona server), "7d", "30d" (N hari
+ * terakhir). Dipilih lewat `?range=` di dashboard.
+ */
+export type PaymentRange = "today" | "7d" | "30d";
+
+/**
+ * Awal rentang (ms) untuk `PaymentRange`, relatif `now` (bisa di-override
+ * untuk pengujian). "today" = awal hari zona server; "7d"/"30d" = `now`
+ * dikurangi N×86.400.000.
+ */
+export function paymentRangeStart(range: PaymentRange, now: Date = new Date()): number {
+  if (range === "today") {
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  const days = range === "7d" ? 7 : 30;
+  return now.getTime() - days * 86_400_000;
+}
+
+/**
+ * SEMUA order platform (terbaru dulu, dengan nama pelanggan) untuk ekspor
+ * CSV admin. `range` opsional membatasi ke order yang dibuat sejak awal
+ * rentang — dipakai tombol "Unduh CSV" agar konsisten dengan filter
+ * tanggal dashboard.
+ */
+export function getAllAdminPaymentRows(range?: PaymentRange): AdminPaymentRow[] {
+  const db = getDB();
+  const startMs = range ? paymentRangeStart(range) : undefined;
+  return db.orders
+    .filter((o) => startMs === undefined || new Date(o.createdAt).getTime() >= startMs)
+    .slice()
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .map((o) => mapPaymentRow(o, db.users));
+}
+
+/**
+ * Ringkasan riwayat pembayaran dashboard admin: jumlah order per status
+ * PEMBAYARAN dalam rentang `range` (hari ini / 7 hari / 30 hari, lewat
+ * `?range=` di halaman) + N order terbaru DI DALAM rentang tersebut dengan
+ * nama pelanggan (join users). Dipakai seksi "Riwayat Pembayaran" di
+ * /admin (kartu ringkasan + tabel aksi retry dari sisi admin).
+ */
+export function getAdminPaymentSummary(
+  range: PaymentRange = "today",
+  limit: number = 8
+) {
+  const db = getDB();
+  const startMs = paymentRangeStart(range);
+  const inRange = db.orders.filter(
+    (o) => new Date(o.createdAt).getTime() >= startMs
+  );
+  const countBy = (s: Order["paymentStatus"]) =>
+    inRange.filter((o) => o.paymentStatus === s).length;
+  const rangePaid = inRange.filter((o) => o.paymentStatus === "paid");
+
+  const recent = db.orders
+    .filter((o) => new Date(o.createdAt).getTime() >= startMs)
+    .slice()
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .slice(0, limit)
+    .map((o) => mapPaymentRow(o, db.users));
+
+  return {
+    range,
+    period: {
+      total: inRange.length,
+      paid: countBy("paid"),
+      failed: countBy("failed"),
+      expired: countBy("expired"),
+      pending: countBy("pending"),
+      revenue: rangePaid.reduce((s, o) => s + o.totalAmount, 0),
+    },
+    recent,
+  };
+}
+
 export function getMerchantStats(merchantId: string) {
   const db = getDB();
   const vouchers = db.vouchers.filter((v) => v.merchantId === merchantId);
@@ -1083,6 +1640,60 @@ export function getMerchantStats(merchantId: string) {
       return s + (v?.nilai ?? 0);
     }, 0),
   };
+}
+
+export interface MerchantDailySummary {
+  /** Voucher merchant yang diklaim sejak awal hari ini (zona server). */
+  claimedToday: number;
+  /** Nilai voucher yang DIREEDEM hari ini (pendapatan merchant). */
+  revenueToday: number;
+  /** Order milik merchant (metadata.merchantId) yang masih pending. */
+  pendingOrders: number;
+}
+
+/**
+ * Ringkasan harian per merchant untuk notifikasi WhatsApp (cron harian):
+ * voucher terklaim hari ini, pendapatan (nilai voucher yang diredeem hari
+ * ini), dan order pending milik merchant. Murni & sinkron — `now` dapat
+ * di-override untuk pengujian batas hari.
+ */
+export function getMerchantDailySummary(
+  merchantId: string,
+  now: Date = new Date()
+): MerchantDailySummary {
+  const db = getDB();
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayStartMs = dayStart.getTime();
+
+  const voucherIds = new Set(
+    db.vouchers.filter((v) => v.merchantId === merchantId).map((v) => v.id)
+  );
+  const claims = db.claimedVouchers.filter((c) => voucherIds.has(c.voucherId));
+
+  const claimedToday = claims.filter(
+    (c) => new Date(c.claimedAt).getTime() >= dayStartMs
+  ).length;
+
+  // Pendapatan = nilai voucher yang diredeem (status used) hari ini.
+  const revenueToday = claims
+    .filter(
+      (c) =>
+        c.status === "used" &&
+        c.usedAt !== undefined &&
+        new Date(c.usedAt).getTime() >= dayStartMs
+    )
+    .reduce((s, c) => {
+      const v = db.vouchers.find((x) => x.id === c.voucherId);
+      return s + (v?.nilai ?? 0);
+    }, 0);
+
+  // Order pending milik merchant (order merchandise via metadata.merchantId).
+  const pendingOrders = db.orders.filter(
+    (o) => o.paymentStatus === "pending" && o.metadata?.merchantId === merchantId
+  ).length;
+
+  return { claimedToday, revenueToday, pendingOrders };
 }
 
 /** Perbandingan role untuk helper UI */

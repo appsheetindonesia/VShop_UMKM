@@ -1,25 +1,39 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import Badge, { paymentBadge } from "@/components/Badge";
 import LogoutButton from "@/components/LogoutButton";
-import RetryPaymentButton from "@/components/RetryPaymentButton";
+import PaymentHistoryList, {
+  filterPaymentOrders,
+  PaymentHistoryControls,
+} from "@/components/PaymentHistoryList";
 import { getSessionUser, isGuest } from "@/lib/auth";
 import { getDB, getStoreMode } from "@/lib/db";
+import { buildListHref } from "@/lib/pagination";
+import { formatDateLong } from "@/lib/format";
+import {
+  listNotificationLogs,
+  NOTIFICATION_TYPE_LABEL,
+  type NotificationLogEntry,
+} from "@/lib/notif-log";
 import { getOrdersByUser } from "@/lib/service";
-import { formatDate, formatDateTime, formatRupiah } from "@/lib/format";
-import type { Order, PaymentAuditEvent, SnapCallbackRecord } from "@/lib/types";
 
 export const metadata: Metadata = {
   title: "Akun",
 };
 
-const TYPE_LABEL: Record<Order["type"], string> = {
-  package: "Paket",
-  topup: "Top Up",
-  merchandise: "Merchandise",
+const NOTIF_STATUS_LABEL: Record<string, { label: string; color: string }> = {
+  sent: { label: "Terkirim", color: "bg-green-100 text-green-700" },
+  demo: { label: "Demo", color: "bg-yellow-100 text-yellow-700" },
+  failed: { label: "Gagal", color: "bg-red-100 text-red-700" },
 };
 
-export default function AkunPage() {
+export default async function AkunPage({
+  searchParams,
+}: {
+  searchParams?: { status?: string; q?: string; type?: string };
+}) {
+  const status = searchParams?.status;
+  const q = searchParams?.q;
+  const type = searchParams?.type;
   const user = getSessionUser();
   const guest = isGuest();
 
@@ -47,6 +61,26 @@ export default function AkunPage() {
   }
 
   const orders = getOrdersByUser(user.id);
+  const filtered = filterPaymentOrders(orders, status, q, type);
+
+  // Riwayat notifikasi WhatsApp per order milik pelanggan ini (log terpusat).
+  const orderNumbers = orders.map((o) => o.orderNumber);
+  const { logs: notifLogs } =
+    orderNumbers.length > 0
+      ? await listNotificationLogs({ orderNumbers, limit: 50 })
+      : { logs: [] as NotificationLogEntry[] };
+  const orderByNumber = new Map(orders.map((o) => [o.orderNumber, o]));
+  const notifGroups = new Map<string, NotificationLogEntry[]>();
+  for (const l of notifLogs) {
+    if (!l.orderNumber) continue;
+    const arr = notifGroups.get(l.orderNumber) ?? [];
+    arr.push(l);
+    notifGroups.set(l.orderNumber, arr);
+  }
+  const notifGroupsOrdered = Array.from(notifGroups.entries()).sort(
+    (a, b) =>
+      new Date(b[1][0].createdAt).getTime() - new Date(a[1][0].createdAt).getTime()
+  );
 
   return (
     <div className="mx-auto max-w-md space-y-4">
@@ -96,179 +130,103 @@ export default function AkunPage() {
             <Link href="/paket" className="btn-primary mt-4 w-full">Lihat Paket</Link>
           </div>
         ) : (
-          <div className="card divide-y divide-gray-100 p-0">
-            {orders.slice(0, 10).map((order) => (
-              <OrderRow key={order.id} order={order} />
-            ))}
+          <div className="space-y-3">
+            <PaymentHistoryControls basePath="/akun" status={status} type={type} q={q} />
+            {filtered.length === 0 ? (
+              <div className="card p-6 text-center">
+                <p className="text-sm text-gray-500">
+                  Tidak ada riwayat dengan filter ini.
+                </p>
+                <Link href="/akun" className="btn-secondary mt-3 w-full !py-2 text-sm">
+                  Reset Filter
+                </Link>
+              </div>
+            ) : (
+              <PaymentHistoryList orders={filtered.slice(0, 5)} />
+            )}
+            {filtered.length > 0 && (
+              <Link
+                href={buildListHref("/akun/riwayat-pembayaran", { status, type, q })}
+                className="btn-secondary w-full !py-2.5 text-sm"
+              >
+                Lihat Semua ({filtered.length})
+              </Link>
+            )}
           </div>
         )}
       </section>
 
+      {notifGroupsOrdered.length > 0 && (
+        <section aria-labelledby="riwayat-notifikasi">
+          <div className="mb-2 px-1">
+            <h2 id="riwayat-notifikasi" className="text-sm font-bold text-gray-900">
+              Notifikasi Order
+            </h2>
+            <p className="text-xs text-gray-400">Riwayat WhatsApp per pesananmu</p>
+          </div>
+          <div className="space-y-3">
+            {notifGroupsOrdered.map(([orderNumber, entries]) => {
+              const order = orderByNumber.get(orderNumber);
+              return (
+                <div key={orderNumber} className="card overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-gray-100 bg-gray-50/60 px-4 py-2">
+                    <span className="font-mono text-xs font-bold text-brand-700">
+                      {orderNumber}
+                    </span>
+                    {order && (
+                      <Link
+                        href={`/transaksi/${order.id}`}
+                        className="text-xs font-medium text-brand-600 hover:underline"
+                      >
+                        Detail transaksi ›
+                      </Link>
+                    )}
+                  </div>
+                  <ul className="divide-y divide-gray-50">
+                    {entries.map((l) => {
+                      const st =
+                        NOTIF_STATUS_LABEL[l.status] ?? {
+                          label: l.status,
+                          color: "bg-gray-100 text-gray-600",
+                        };
+                      return (
+                        <li key={l.id} className="flex items-start gap-3 px-4 py-2.5">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-semibold text-gray-800">
+                                {NOTIFICATION_TYPE_LABEL[l.type] ?? l.type}
+                              </span>
+                              <span
+                                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${st.color}`}
+                              >
+                                {st.label}
+                              </span>
+                            </div>
+                            {l.error && (
+                              <p className="mt-0.5 text-[11px] text-red-600">{l.error}</p>
+                            )}
+                            {l.templateName && (
+                              <p className="mt-0.5 truncate font-mono text-[10px] text-gray-400">
+                                template: {l.templateName}
+                              </p>
+                            )}
+                          </div>
+                          <span className="whitespace-nowrap text-[10px] text-gray-400">
+                            {formatDateLong(l.createdAt)}
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       <LogoutButton className="btn-secondary w-full !text-red-600" />
     </div>
-  );
-}
-
-/** Satu baris riwayat pembayaran + aksi sesuai status. */
-function OrderRow({ order }: { order: Order }) {
-  const reason =
-    typeof order.metadata?.failureReason === "string" ? order.metadata.failureReason : undefined;
-  const retryable = order.paymentStatus === "failed" || order.paymentStatus === "expired";
-  const callbacks = Array.isArray(order.metadata?.snapCallbacks)
-    ? (order.metadata.snapCallbacks as SnapCallbackRecord[])
-    : [];
-  const audit = Array.isArray(order.metadata?.paymentAudit)
-    ? (order.metadata.paymentAudit as PaymentAuditEvent[])
-    : [];
-  const status = paymentBadge(order.paymentStatus, reason);
-
-  return (
-    <div className="p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <p className="truncate text-sm font-bold text-gray-900">{order.orderNumber}</p>
-            <Badge color={status.color}>{status.label}</Badge>
-          </div>
-          <p className="mt-0.5 text-xs text-gray-500">
-            {TYPE_LABEL[order.type]} · {formatDate(order.createdAt)}
-            {order.paymentMethod ? ` · ${order.paymentMethod}` : ""}
-          </p>
-        </div>
-        <p className="shrink-0 text-sm font-extrabold text-gray-900">
-          {formatRupiah(order.totalAmount)}
-        </p>
-      </div>
-
-      {audit.length > 0 && <PaymentAuditHistory events={audit} />}
-
-      {callbacks.length > 0 && <SnapCallbackHistory callbacks={callbacks} />}
-
-      <div className="mt-2">
-        {order.paymentStatus === "paid" ? (
-          <Link href={`/sukses?order=${order.id}`} className="btn-secondary w-full py-2 text-sm">
-            Lihat Detail
-          </Link>
-        ) : retryable ? (
-          <RetryPaymentButton
-            orderId={order.id}
-            className="btn-primary w-full py-2 text-sm"
-          />
-        ) : (
-          <Link href={`/bayar/${order.id}`} className="btn-secondary w-full py-2 text-sm">
-            Lanjut Bayar
-          </Link>
-        )}
-      </div>
-    </div>
-  );
-}
-
-const AUDIT_EVENT_LABEL: Record<string, string> = {
-  created: "Dibuat",
-  paid: "Berhasil",
-  failed: "Gagal",
-  expired: "Kadaluarsa",
-  pending: "Menunggu",
-  retry: "Coba Lagi",
-  success: "Snap Berhasil",
-  error: "Snap Error",
-  close: "Snap Ditutup",
-};
-
-const AUDIT_SOURCE_LABEL: Record<string, string> = {
-  create: "Order",
-  snap: "Snap",
-  "status-api": "Status API",
-  webhook: "Webhook",
-  "client-fail": "Layar bayar",
-  cron: "Auto-expire",
-  retry: "Coba Lagi",
-  mock: "Demo",
-};
-
-/**
- * Kronologi status pembayaran per order (metadata.paymentAudit): status_code /
- * status_message Midtrans dari webhook, Status API, callback Snap, retry,
- * dst. — terbaru di atas. Setiap kegagalan bisa ditelusuri urutannya.
- */
-function PaymentAuditHistory({ events }: { events: PaymentAuditEvent[] }) {
-  return (
-    <details className="mt-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
-      <summary className="cursor-pointer select-none text-xs font-semibold text-gray-600">
-        Riwayat Status Pembayaran ({events.length})
-      </summary>
-      <ul className="mt-2 space-y-1.5">
-        {[...events].reverse().map((ev, i) => (
-          <li key={i} className="text-xs text-gray-600">
-            <span className="font-semibold text-gray-800">
-              {AUDIT_EVENT_LABEL[ev.event] ?? ev.event}
-            </span>
-            <span className="text-gray-400">
-              {" "}· {AUDIT_SOURCE_LABEL[ev.source] ?? ev.source}
-              {ev.orderNumber ? ` · ${ev.orderNumber}` : ""}
-              {ev.statusCode ? ` · kode ${ev.statusCode}` : ""}
-              {" "}· {formatDateTime(ev.at)}
-            </span>
-            {(ev.statusMessage || ev.transactionStatus || ev.detail) && (
-              <span className="mt-0.5 block font-mono text-[11px] text-gray-500">
-                {ev.statusMessage ?? ev.transactionStatus ?? ev.detail}
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </details>
-  );
-}
-
-const SNAP_EVENT: Record<string, { label: string; dot: string }> = {
-  success: { label: "Berhasil", dot: "bg-green-500" },
-  pending: { label: "Menunggu", dot: "bg-yellow-400" },
-  error: { label: "Error", dot: "bg-red-500" },
-  close: { label: "Ditutup", dot: "bg-gray-400" },
-};
-
-/** Ringkasan satu baris dari hasil transaksi Snap (audit). */
-function snapResultLine(result?: Record<string, unknown>): string {
-  if (!result) return "";
-  const bits: string[] = [];
-  if (typeof result.transaction_status === "string") bits.push(result.transaction_status);
-  if (typeof result.status_code === "string") bits.push(`kode ${result.status_code}`);
-  if (typeof result.payment_type === "string") bits.push(result.payment_type);
-  if (typeof result.transaction_id === "string") bits.push(`#${result.transaction_id.slice(0, 12)}`);
-  return bits.join(" · ");
-}
-
-/** Riwayat callback Snap.js order (dari metadata.snapCallbacks), paling baru di atas. */
-function SnapCallbackHistory({ callbacks }: { callbacks: SnapCallbackRecord[] }) {
-  const latest = callbacks[callbacks.length - 1];
-  return (
-    <details className="mt-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
-      <summary className="cursor-pointer select-none text-xs font-semibold text-gray-600">
-        Riwayat callback Snap ({callbacks.length})
-        {latest && ` · terakhir: ${SNAP_EVENT[latest.event]?.label ?? latest.event}`}
-      </summary>
-      <ul className="mt-2 space-y-1.5">
-        {[...callbacks].reverse().map((cb, i) => (
-          <li key={i} className="text-xs text-gray-600">
-            <span className="flex items-center gap-1.5 font-semibold text-gray-800">
-              <span
-                className={`inline-block h-2 w-2 rounded-full ${SNAP_EVENT[cb.event]?.dot ?? "bg-gray-400"}`}
-                aria-hidden="true"
-              />
-              {SNAP_EVENT[cb.event]?.label ?? cb.event}
-              <span className="font-normal text-gray-400">· {formatDateTime(cb.at)}</span>
-            </span>
-            {snapResultLine(cb.result) && (
-              <span className="mt-0.5 block font-mono text-[11px] text-gray-500">
-                {snapResultLine(cb.result)}
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </details>
   );
 }
 
